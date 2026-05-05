@@ -282,7 +282,7 @@ class DynamicReplicaDataset(Dataset):
     def __init__(
         self,
         mode: str = "TEST",
-        data_root: str = "C:\\Development\\AI\\CV2\\dynamic_stereo\\dynamic_replica_data\\test",
+        data_root: str = ".\\data\\dynamicreplica",
         input_image_res: Tuple[int] = (256, 256),
         input_image_num: int = 8,
         output_image_res: Tuple[int] = (256, 256),
