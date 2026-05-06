@@ -379,8 +379,8 @@ class DynamicReplicaDataset(Dataset):
                 Ws = [ meta[1][1] for meta in output["metadata"]]
 
                 # output["viewpoint"] [:] is the camera parameters [0] for left, including R and T
-                ts = [ viewpoint[0].T for viewpoint in output["viewpoint"]]
-                RTs = [ viewpoint[0].R for viewpoint in output["viewpoint"]]
+                ts = [ viewpoint[0]["T"] for viewpoint in output["viewpoint"]]
+                RTs = [ viewpoint[0]["R"] for viewpoint in output["viewpoint"]]
 
                 # TODO: map the K
                 Ks = []
