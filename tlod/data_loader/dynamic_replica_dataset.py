@@ -117,133 +117,6 @@ def load_dataclass(file_obj: Any, expected_type: Any) -> Any:
     return _load_dataclass_value(data, expected_type)
 
 
-def load_dynamic_replica_cameras(path, frame_sample=(0, None, 1)):
-    """
-    Load camera poses and intrinsics from dynamic replica .npz files
-    
-    Args:
-        path: Path to the directory containing sequence data
-        frame_sample: Tuple of (start, end, step) for frame sampling
-        
-    Returns:
-        Tuple of (image_files, Hs, Ws, Ks, RTs, ts)
-        where:
-            image_files: List of image file paths
-            Hs: Array of image heights
-            Ws: Array of image widths
-            Ks: Array of intrinsic matrices (fx, fy, cx, cy)
-            RTs: Array of extrinsic matrices (rotation, translation)
-            ts: Array of timestamps
-    """
-    b, e, s = frame_sample
-    
-    if not os.path.exists(path):
-        logger.warn(f"Path does not exist: {path}")
-        return [], np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
-    
-    # Find all image files from the images folder
-    image_folder = os.path.join(path, "images")
-    image_files = sorted([f for f in os.listdir(image_folder) if f.endswith('.png')])
-    if not image_files:
-        logger.warn(f"No .png files found in {image_folder}")
-        return [], np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
-    
-    # Load trajectories from folder
-    trajectory_files = []
-    trajectories_folder = os.path.join(path, "trajectories")
-    if not os.path.exists(trajectories_folder):
-        logger.warn(f"Trajectories folder does not exist: {trajectories_folder}")
-    else:
-        trajectory_files = sorted([f for f in os.listdir(trajectories_folder) if f.endswith('.pth')])
-
-    if len(trajectory_files) != len(image_files):
-        logger.warn(f"Number of trajectory files ({len(trajectory_files)}) does not match number of images ({len(image_files)})")
-
-    # Find corresponding .npz files for camera data
-    # camera_files = sorted([f for f in os.listdir(path) if f.endswith('.npz')])
-    
-    # if len(image_files) != len(camera_files):
-    #     logger.warn(f"Number of images ({len(image_files)}) does not match camera files ({len(camera_files)})")
-    
-    # based on https://github.com/facebookresearch/dynamic_stereo/blob/dfe2907faf41b810e6bb0c146777d81cb48cb4f5/datasets/dynamic_stereo_datasets.py#L301
-    # load the frame annotations
-
-
-
-    # Apply frame sampling
-    total_frames = len(image_files)
-    frame_indices = list(range(b or 0, e or total_frames, s or 1))
-    
-    image_files = [image_files[i] for i in frame_indices]
-    #camera_files = [camera_files[i] if i < len(camera_files) else None for i in frame_indices]
-    
-    Hs = []
-    Ws = []
-    Ks = []
-    RTs = []
-    ts = []
-    
-    for i, (img_file, cam_file) in enumerate(zip(image_files, trajectory_files)):
-        img_path = os.path.join(path, img_file)
-        
-        # Load image to get dimensions
-        img = iio.imread(img_path)
-        H, W = img.shape[:2]
-        Hs.append(H)
-        Ws.append(W)
-        
-        # Load camera parameters from .npz file
-        if cam_file and os.path.exists(os.path.join(path, cam_file)):
-
-            # keys: ['traj_3d_world', 'traj_2d', 'verts_inds_vis', 'img', 'instances']
-            cam_data = torch.load(os.path.join(path, cam_file))
-            
-            # Extract camera pose (4x4 matrix, world-to-camera or camera-to-world)
-            if 'camera_pose' in cam_data:
-                c2w = cam_data['camera_pose']
-                # Convert camera-to-world to world-to-camera if needed
-                RT = np.linalg.inv(c2w)
-            else:
-                RT = np.eye(4)
-            
-            # Extract intrinsics [fx, fy, cx, cy]
-            if 'fxfycxcy' in cam_data:
-                fxfycxcy = cam_data['fxfycxcy']
-                K = np.eye(3, dtype=np.float32)
-                K[0, 0] = fxfycxcy[0]  # fx
-                K[1, 1] = fxfycxcy[1]  # fy
-                K[0, 2] = fxfycxcy[2]  # cx
-                K[1, 2] = fxfycxcy[3]  # cy
-            else:
-                # Default intrinsics if not provided
-                K = np.array([
-                    [W, 0, W/2],
-                    [0, W, H/2],
-                    [0, 0, 1]
-                ], dtype=np.float32)
-        else:
-            # Default to identity pose and basic intrinsics
-            RT = np.eye(4)
-            K = np.array([
-                [W, 0, W/2],
-                [0, W, H/2],
-                [0, 0, 1]
-            ], dtype=np.float32)
-        
-        Ks.append(K)
-        RTs.append(RT)
-        ts.append(float(i))  # Use frame index as timestamp
-    
-    return (
-        image_files,
-        np.array(Hs),
-        np.array(Ws),
-        np.array(Ks),
-        np.array(RTs),
-        np.array(ts, dtype=np.float32),
-    )
-
-
 def load_dynamic_replica_images(image_files, data_path, xs, ys, Ws, Hs, hs, ws):
     """
     Load images from dynamic replica dataset
@@ -449,8 +322,8 @@ class DynamicReplicaDataset(Dataset):
         # TODO: remove this debug code and parallelize loading
         print(sample_list[0].keys()) # ['image', 'depth', 'mask', 'viewpoint', 'metadata']
         example = self.getitem_from_sample(sample_list[0])
-        print(example.keys()) # ['metadata', 'img', 'disp', 'valid_disp', 'mask']
-        output_list = [example]
+        print(example.keys()) # ['metadata', 'img', 'disp', 'valid_disp', 'mask', 'viewpoint']
+        output_list = [[example]]
 
         # Load camera parameters for each sequence
         # output_list = []
@@ -490,26 +363,27 @@ class DynamicReplicaDataset(Dataset):
         self.lengths = []
         self.seqs = dotdict()
         
+        # TODO: seq_data_roots is not used for dynamic replica, the first iteration could be removed
         for i, (seq_data_root, outputs) in enumerate(
             zip(self.seq_data_roots, output_list)
         ):
             logger.info(f'Parsing "{seq_data_root}" images')
             
             for j, (key, output) in enumerate(zip(seqs, outputs)):
-                print(output)
-                # TODO: fix all the mapping issues
+                print('output', output.keys()) # ['viewpoint', 'metadata', 'img', 'disp', 'valid_disp', 'mask']
 
                 ims = output['img']
-                metadatas = output['metadata']
-                # split metadatas to Hs and Ws, now it's an array of [sequence_name, (H, W)]
-                Hs = np.array([metadata[1][0] for metadata in metadatas])
-                Ws = np.array([metadata[1][1] for metadata in metadatas])
 
-                print(Hs)
-                print(Ws)
+                # output["metadata"] [:] [1] is the image size (H, W)
+                Hs = [ meta[1][0] for meta in output["metadata"]]
+                Ws = [ meta[1][1] for meta in output["metadata"]]
 
-                # TODO: map the rest
-                Ks, RTs, ts = output
+                # output["viewpoint"] [:] is the camera parameters [0] for left, including R and T
+                ts = [ viewpoint[0].T for viewpoint in output["viewpoint"]]
+                RTs = [ viewpoint[0].R for viewpoint in output["viewpoint"]]
+
+                # TODO: map the K
+                Ks = []
                 
                 if not len(ims):
                     logger.warn(f"Empty sequence {key}")
@@ -659,13 +533,17 @@ class DynamicReplicaDataset(Dataset):
                     mask = np.array(mask) / 255.0
                     output_tensor["mask"][i].append(mask)
 
-                # if "viewpoint" in sample and cam in sample["viewpoint"]:
+                if "viewpoint" in sample and cam in sample["viewpoint"]:
                 #     viewpoint = self._get_pytorch3d_camera(
                 #         sample["viewpoint"][cam][i],
                 #         sample["metadata"][cam][i][1],
                 #         scale=1.0,
                 #     )
-                #     output_tensor["viewpoint"][i].append(viewpoint)
+                    viewpoint = {
+                        "R": torch.tensor(sample["viewpoint"][cam][i]["R"], dtype=torch.float)[None],
+                        "T": torch.tensor(sample["viewpoint"][cam][i]["T"], dtype=torch.float)[None],
+                    }
+                    output_tensor["viewpoint"][i].append(viewpoint)
 
                 if "metadata" in sample and cam in sample["metadata"]:
                     metadata = sample["metadata"][cam][i]
@@ -766,8 +644,8 @@ class DynamicReplicaDataset(Dataset):
                     output_tensor["viewpoint"][i][cam] = viewpoint
 
         res = {}
-        # if "viewpoint" in output_tensor:
-        #     res["viewpoint"] = output_tensor["viewpoint"]
+        if "viewpoint" in output_tensor:
+            res["viewpoint"] = output_tensor["viewpoint"]
         if "metadata" in output_tensor:
             res["metadata"] = output_tensor["metadata"]
 
