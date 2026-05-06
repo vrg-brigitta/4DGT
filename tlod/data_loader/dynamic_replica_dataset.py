@@ -319,40 +319,21 @@ class DynamicReplicaDataset(Dataset):
                 counter+=1 
 
 
-        # TODO: remove this debug code and parallelize loading
-        print(sample_list[0].keys()) # ['image', 'depth', 'mask', 'viewpoint', 'metadata']
+        # TODO: remove this debug code
+        # For a quick run just check with the first sample
         example = self.getitem_from_sample(sample_list[0])
-        print(example.keys()) # ['metadata', 'img', 'disp', 'valid_disp', 'mask', 'viewpoint']
         output_list = [[example]]
 
-        # Load camera parameters for each sequence
+        # TODO: Activate the full run
         # output_list = []
-        # for i, sample in enumerate(sample_list):
-        #     # outputs = parallel_execution(
-        #     #     action=partial(
-        #     #         self.getitem_from_sample,
-        #     #         sample,
-        #     #     ),
-        #     #     print_progress=False,
-        #     #     callback=print_progress,
-        #     # )
-        #     output_list.append(self.getitem_from_sample(sample))
-
-        
         # for i, seq_data_root in enumerate(self.seq_data_roots):
         #     logger.info(f'Loading "{seq_data_root}" camera poses from dynamic replica')
             
-        #     b_frame, e_frame, s_frame = frame_sample
-            
-        #     inputs = [
-        #         os.path.join(data_root, key, seq_data_root) if seq_data_root else os.path.join(data_root, key)
-        #         for key in seqs
-        #     ]
+        #     inputs = sample_list
         #     outputs = parallel_execution(
         #         inputs,
         #         action=partial(
-        #             load_dynamic_replica_cameras,
-        #             frame_sample=(b_frame, e_frame, s_frame),
+        #             self.getitem_from_sample,
         #         ),
         #         print_progress=False,
         #         callback=print_progress,
@@ -374,9 +355,9 @@ class DynamicReplicaDataset(Dataset):
 
                 ims = output['img']
 
-                # output["metadata"] [:] [1] is the image size (H, W)
-                Hs = [ meta[1][0] for meta in output["metadata"]]
-                Ws = [ meta[1][1] for meta in output["metadata"]]
+                # output["metadata"] [:] [0] (0 for left), is the tuple (name, image size (H, W))
+                Hs = [ meta[0][1][0] for meta in output["metadata"]]
+                Ws = [ meta[0][1][1] for meta in output["metadata"]]
 
                 # output["viewpoint"] [:] is the camera parameters [0] for left, including R and T
                 ts = [ viewpoint[0]["T"] for viewpoint in output["viewpoint"]]
