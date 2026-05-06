@@ -359,12 +359,10 @@ class DynamicReplicaDataset(Dataset):
                 Hs = [ meta[0][1][0] for meta in output["metadata"]]
                 Ws = [ meta[0][1][1] for meta in output["metadata"]]
 
-                # output["viewpoint"] [:] is the camera parameters [0] for left, including R and T
+                # output["viewpoint"] [:] is the camera parameters [0] for left, including R and T & K
                 ts = [ viewpoint[0]["T"] for viewpoint in output["viewpoint"]]
                 RTs = [ viewpoint[0]["R"] for viewpoint in output["viewpoint"]]
-
-                # TODO: map the K
-                Ks = []
+                Ks = [ viewpoint[0]["K"] for viewpoint in output["viewpoint"]]
                 
                 if not len(ims):
                     logger.warn(f"Empty sequence {key}")
@@ -520,9 +518,53 @@ class DynamicReplicaDataset(Dataset):
                 #         sample["metadata"][cam][i][1],
                 #         scale=1.0,
                 #     )
+
+                    entry_viewpoint = sample["viewpoint"][cam][i]
+                    image_size = sample["metadata"][cam][i][1]  # (H, W)
+                    scale = 1.0
+
+                    principal_point = torch.tensor(entry_viewpoint["principal_point"], dtype=torch.float)
+                    focal_length = torch.tensor(entry_viewpoint["focal_length"], dtype=torch.float)
+
+                    half_image_size_wh_orig = (
+                        torch.tensor(list(reversed(image_size)), dtype=torch.float) / 2.0
+                    )
+
+                    # first, we convert from the dataset's NDC convention to pixels
+                    format = entry_viewpoint["intrinsics_format"]
+                    if format.lower() == "ndc_norm_image_bounds":
+                        # this is e.g. currently used in CO3D for storing intrinsics
+                        rescale = half_image_size_wh_orig
+                    elif format.lower() == "ndc_isotropic":
+                        rescale = half_image_size_wh_orig.min()
+                    else:
+                        raise ValueError(f"Unknown intrinsics format: {format}")
+
+                    # principal point and focal length in pixels
+                    principal_point_px = half_image_size_wh_orig - principal_point * rescale
+                    focal_length_px = focal_length * rescale
+
+                    # now, convert from pixels to PyTorch3D v0.5+ NDC convention
+                    # if self.image_height is None or self.image_width is None:
+                    out_size = list(reversed(image_size))
+
+                    half_image_size_output = torch.tensor(out_size, dtype=torch.float) / 2.0
+                    half_min_image_size_output = half_image_size_output.min()
+
+                    # rescaled principal point and focal length in ndc
+                    principal_point = (
+                        half_image_size_output - principal_point_px * scale
+                    ) / half_min_image_size_output
+                    focal_length = focal_length_px * scale / half_min_image_size_output
+
                     viewpoint = {
                         "R": torch.tensor(sample["viewpoint"][cam][i]["R"], dtype=torch.float)[None],
                         "T": torch.tensor(sample["viewpoint"][cam][i]["T"], dtype=torch.float)[None],
+                        "K": torch.tensor([
+                            [focal_length[0], 0, principal_point[0]],
+                            [0, focal_length[1], principal_point[1]],
+                            [0, 0, 1],
+                        ], dtype=torch.float)
                     }
                     output_tensor["viewpoint"][i].append(viewpoint)
 
