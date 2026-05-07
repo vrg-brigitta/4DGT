@@ -2,9 +2,15 @@
 # All rights reserved.
 
 """
-Dynamic Replica dataset loader
-Adapted from mvaria_dataset.py for loading dynamic replica data
-Preload things we need into memory, including camera parameters and images
+Dynamic Replica dataset loader for 4DGT (mono).
+Adapted from mvaria_dataset.py. Loads ONLY the left camera (4DGT is mono).
+
+Conventions enforced (matching tlod/data_loader/utils.load_camera_poses):
+  - Hs, Ws : np.int32, shape (F,)
+  - Ks     : np.float32, shape (F, 3, 3)            -- pixel-space
+  - RTs    : np.float32, shape (F, 4, 4)            -- world-to-camera (OpenCV)
+  - ts     : np.float64, shape (F,)                 -- seconds
+  - ims    : np.ndarray[str], shape (F,)            -- ABSOLUTE image paths
 """
 
 import gzip
@@ -22,36 +28,32 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from tlod.data_loader.utils import readPFM, load_16big_png_depth
-from ..easyvolcap.utils.cam_utils import (
-    align_c2ws,
-    average_c2ws,
-)
-from ..easyvolcap.utils.console_utils import (
-    dotdict,
-    logger,
-    magenta,
-)
+from ..easyvolcap.utils.cam_utils import align_c2ws, average_c2ws
+from ..easyvolcap.utils.console_utils import dotdict, logger, magenta
 from ..easyvolcap.utils.data_utils import as_numpy_func
 from ..easyvolcap.utils.math_utils import affine_inverse, affine_padding
+from .utils import pack_c2ws_to_cameras
 
 
+# ---------------------------------------------------------------------------
+# Annotation dataclasses (exact copy of Dynamic Replica's frame_annotations)
+# ---------------------------------------------------------------------------
 @dataclass
 class FileAnnotation:
     path: str
-    size: Optional[Tuple[int, int]] = None
+    size: Optional[Tuple[int, int]] = None  # (H, W)
 
 
 @dataclass
 class DynamicReplicaFrameAnnotation:
-    """A dataclass used to load annotations from json."""
-
     sequence_name: str
     camera_name: Optional[str] = None
     image: Optional[FileAnnotation] = None
     depth: Optional[FileAnnotation] = None
     mask: Optional[FileAnnotation] = None
     viewpoint: Any = None
+    frame_number: Optional[int] = None
+    frame_timestamp: Optional[float] = None
 
 
 def _load_dataclass_value(value: Any, expected_type: Any) -> Any:
@@ -86,729 +88,363 @@ def _load_dataclass_value(value: Any, expected_type: Any) -> Any:
         if not isinstance(value, dict):
             return value
         field_types = {f.name: f.type for f in fields(expected_type)}
-        kwargs = {}
-        for key, val in value.items():
-            if key in field_types:
-                kwargs[key] = _load_dataclass_value(val, field_types[key])
+        kwargs = {k: _load_dataclass_value(v, field_types[k])
+                  for k, v in value.items() if k in field_types}
         return expected_type(**kwargs)
 
     if isinstance(value, expected_type):
         return value
-
     if expected_type in (str, int, float, bool):
         return expected_type(value)
-
     return value
 
 
 def load_dataclass(file_obj: Any, expected_type: Any) -> Any:
-    data = json.load(file_obj)
-    return _load_dataclass_value(data, expected_type)
+    return _load_dataclass_value(json.load(file_obj), expected_type)
 
 
-def load_dynamic_replica_images(image_files, data_path, xs, ys, Ws, Hs, hs, ws):
+# ---------------------------------------------------------------------------
+# Camera helpers
+# ---------------------------------------------------------------------------
+def _viewpoint_to_K_pixels(vp: dict, image_size: Tuple[int, int]) -> np.ndarray:
+    """Convert a Dynamic Replica NDC viewpoint to a pixel-space 3x3 K matrix.
+
+    image_size: (H, W) as stored in the annotation.
     """
-    Load images from dynamic replica dataset
-    
-    Args:
-        image_files: List of image file names
-        data_path: Path to directory containing images
-        xs, ys: x, y crop offsets for each image
-        Ws, Hs: Original widths and heights
-        hs, ws: Target heights and widths after resizing
-        
-    Returns:
-        Array of images of shape (N, H, W, C)
+    principal_point = torch.tensor(vp["principal_point"], dtype=torch.float)
+    focal_length = torch.tensor(vp["focal_length"], dtype=torch.float)
+    half_wh = torch.tensor(list(reversed(image_size)), dtype=torch.float) / 2.0  # (W/2, H/2)
+    fmt = vp["intrinsics_format"].lower()
+    if fmt == "ndc_norm_image_bounds":
+        rescale = half_wh
+    elif fmt == "ndc_isotropic":
+        rescale = half_wh.min()
+    else:
+        raise ValueError(f"Unknown intrinsics format: {fmt}")
+    pp_px = half_wh - principal_point * rescale
+    fl_px = focal_length * rescale
+    return np.array([
+        [float(fl_px[0]), 0.0,             float(pp_px[0])],
+        [0.0,             float(fl_px[1]), float(pp_px[1])],
+        [0.0,             0.0,             1.0],
+    ], dtype=np.float32)
+
+
+def _viewpoint_to_RT_w2c(vp: dict) -> np.ndarray:
+    """Dynamic Replica stores PyTorch3D-style cameras (row-vector convention):
+        x_cam = x_world @ R + T
+    OpenCV w2c uses column-vector:
+        x_cam = R_cv @ x_world + t_cv
+    => R_cv = R_p3d.T, t_cv = T_p3d
     """
+    R_p3d = np.asarray(vp["R"], dtype=np.float32)
+    T_p3d = np.asarray(vp["T"], dtype=np.float32).reshape(3)
+    RT = np.eye(4, dtype=np.float32)
+    RT[:3, :3] = R_p3d.T
+    RT[:3, 3] = T_p3d
+    return RT
+
+
+# ---------------------------------------------------------------------------
+# Image loader (mvaria-style: read -> resize -> crop -> [-1, 1])
+# ---------------------------------------------------------------------------
+def load_dynamic_replica_images(image_files, xs, ys, Ws, Hs, hs, ws):
     imgs = []
-    for i, img_file in enumerate(image_files):
-        img_path = os.path.join(data_path, img_file)
+    for i, img_path in enumerate(image_files):
         img = iio.imread(img_path)
-
-        # Convert to float if needed
         if img.dtype != np.float32:
             img = img.astype(np.float32) / 255.0
-
-        # Resize
-        img = cv2.resize(img, dsize=(ws[i], hs[i]))
-
-        # Crop
+        if img.ndim == 2:
+            img = np.tile(img[..., None], (1, 1, 3))
+        else:
+            img = img[..., :3]
+        img = cv2.resize(img, dsize=(int(ws[i]), int(hs[i])))
         img = img[ys[i]:ys[i] + Hs[i], xs[i]:xs[i] + Ws[i]]
-
+        assert img.shape[:2] == (int(Hs[i]), int(Ws[i])), (
+            f"Frame {i}: crop produced {img.shape[:2]}, expected ({Hs[i]}, {Ws[i]}). "
+            f"resize=({ws[i]},{hs[i]})  crop_offset=({xs[i]},{ys[i]})"
+        )
         imgs.append(img)
+    return np.stack(imgs)  # (F, H, W, 3) float32 in [0,1]
 
-    return np.array(imgs)
 
-
+# ===========================================================================
+# Dataset
+# ===========================================================================
 class DynamicReplicaDataset(Dataset):
+    """
+    4DGT-compatible loader for Dynamic Replica (mono / left camera).
+
+    Returns the same batch structure as AriaDataset:
+        rgb_input, rgb_output            : (F, 3, H, W)
+        rays_t_un_input, rays_t_un_output: (F,)
+        cameras_input, cameras_output    : (F, 20)
+        img_name_output                  : list[str]
+        ratios_output                    : (F,)
+        c2w_avg                          : (4, 4)
+    """
+
     def __init__(
-            self,
-            mode: str = "TEST",
-            data_root: str = ".\\data\\dynamicreplica",
-            input_image_res: Tuple[int] = (256, 256),
-            input_image_num: int = 8,
-            output_image_res: Tuple[int] = (256, 256),
-            output_image_num: int = 8,
-            seq_sample: Tuple[Optional[int]] = (0, None, 1),
-            frame_sample: Tuple[Optional[int]] = (0, None, 1),
-            view_sample: Tuple[Optional[int]] = (0, 1, 1),
-            sample_interval: int = 1,
-            seq_data_roots: Tuple[str] = ("",),
-            align_cameras: bool = False,
-            novel_time_sampling: bool = False,
-            novel_time_frame_sample: Tuple[Optional[int]] = (0, None, 2),
-            novel_view_interp_input: bool = False,
-            novel_view_timestamps: Tuple[float] = (),
-            novel_view_spiral_window: int = 32,
-            loaded_to_seconds: float = 1.0,
-            loaded_to_meters: float = 1.0,
-            force_reload: bool = False,
-            **kwargs,
+        self,
+        mode: str = "TEST",
+        data_root: str = "./data/dynamic_replica_data",
+        input_image_res: Tuple[int, int] = (256, 256),
+        input_image_num: int = 8,
+        output_image_res: Tuple[int, int] = (256, 256),
+        output_image_num: int = 8,
+        seq_sample: Tuple[Optional[int], Optional[int], Optional[int]] = (0, None, 1),
+        frame_sample: Tuple[Optional[int], Optional[int], Optional[int]] = (0, None, 1),
+        view_sample: Tuple[Optional[int], Optional[int], Optional[int]] = (0, 1, 1),
+        sample_interval: int = 1,
+        seq_data_roots: Tuple[str] = ("",),
+        align_cameras: bool = False,
+        novel_time_sampling: bool = False,
+        novel_time_frame_sample: Tuple[Optional[int], Optional[int], Optional[int]] = (0, None, 2),
+        novel_view_interp_input: bool = False,
+        novel_view_timestamps: Tuple[float] = (),
+        novel_view_spiral_window: int = 32,
+        loaded_to_seconds: float = 1.0,
+        loaded_to_meters: float = 1.0,
+        fps: float = 30.0,
+        force_reload: bool = False,
+        **kwargs,
     ):
-        """
-        DynamicReplicaDataset for inference/testing.
-        
-        Args:
-            mode: Must be "TEST" OR "VAL"/"VALIDATION" - this dataset only supports inference mode
-            data_root: Root directory containing the dynamic replica data
-            
-            # Image definition
-            input_image_res: Resolution for input images
-            input_image_num: Number of input images
-            output_image_res: Resolution for output images
-            output_image_num: Number of output images
-            
-            # Frame definition
-            seq_sample: Sequence sampling [start, end, step]
-            frame_sample: Frame sampling [start, end, step]
-            view_sample: View sampling [start, end, step] - only first view used
-            sample_interval: Distance between frames to sample
-            
-            # Data paths
-            seq_data_roots: Root directories for sequence data (usually just one)
-            align_cameras: Use average camera pose
-            
-            # Novel view/time settings
-            novel_time_sampling: Whether to do novel time sampling
-            novel_time_frame_sample: Novel time frame sampling parameters
-            novel_view_interp_input: Whether to interpolate novel views for input
-            novel_view_timestamps: Specific timestamps for novel views
-            novel_view_spiral_window: Number of frames centering target for spiral lookat
-            
-            # Data loading settings
-            loaded_to_seconds: Conversion factor for timestamps to seconds
-            loaded_to_meters: Conversion factor for distances to meters
-            force_reload: Force reload data even if cached
-        """
         super().__init__()
 
+        # Accept VAL / VALIDATION / VALID as aliases of TEST (Dynamic Replica only ships test/valid)
         mode_upper = mode.upper()
         if mode_upper in ("VAL", "VALIDATION", "VALID"):
-            mode = "VALID"
-            mode_upper = "TEST"
-
-        assert mode_upper == "TEST", f"DynamicReplicaDataset only supports TEST/VALID mode, got {mode}"
-
-        # Discover sequences - each subdirectory is a sequence - but only the one endind with _left
-        split = mode.lower()
-        seq_dir = os.path.join(data_root, split)
-        if os.path.isdir(seq_dir):
-            seqs = sorted([d for d in os.listdir(seq_dir)
-                           if os.path.isdir(os.path.join(seq_dir, d)) and d.endswith("_left")])
-
-            # Apply sequence sampling
-            b, e, s = seq_sample
-            seqs = seqs[b:e:s]
+            split = "valid"
+        elif mode_upper == "TEST":
+            split = "test"
+        elif mode_upper == "TRAIN":
+            split = "train"
         else:
-            seqs = []
-            logger.warn(f"Data root does not exist: {data_root}")
+            raise ValueError(f"Unknown mode {mode}")
+        # The dataset is currently inference-only for 4DGT (no training augmentation).
+        # We still allow loading TRAIN annotations if you want to evaluate them.
 
         self.data_root = data_root
         self.input_image_res = input_image_res
         self.input_segment_length = input_image_num
         self.output_image_res = output_image_res
         self.output_segment_length = output_image_num
-
         self.seq_data_roots = deepcopy(seq_data_roots)
         self.view_sample = view_sample
         self.batch_image_num = max(input_image_num, output_image_num)
-
         self.novel_time_sampling = novel_time_sampling
         self.novel_time_frame_sample = novel_time_frame_sample
-
         self.align_cameras = align_cameras
-        self.sample_interval = sample_interval
-
+        self.sample_interval = max(1, int(sample_interval))
         self.novel_view_interp_input = novel_view_interp_input
         self.novel_view_timestamps = novel_view_timestamps
         self.novel_view_spiral_window = novel_view_spiral_window
+        self.loaded_to_seconds = loaded_to_seconds
+        self.loaded_to_meters = loaded_to_meters
+        self.fps = fps
 
-        max_image_size = max(max(input_image_res), max(output_image_res))
+        # ------------------------------------------------------------------
+        # Load frame annotations (a single .jgz file per split)
+        # ------------------------------------------------------------------
+        annot_path = os.path.join(data_root, split, f"frame_annotations_{split}.jgz")
+        if not os.path.isfile(annot_path):
+            raise FileNotFoundError(f"Cannot find {annot_path}")
 
-        b, e, s = view_sample
+        with gzip.open(annot_path, "rt", encoding="utf8") as zipfile:
+            frame_annots_list = load_dataclass(zipfile, List[DynamicReplicaFrameAnnotation])
 
-        seqs = np.asarray(seqs)
-        logger.info(
-            f"Number of sequences used for {magenta(mode)}: {len(seqs)}, seqs: {seqs}"
-        )
-
-        # load frame annotations
-        split = mode.lower()
-        frame_annotations_file = f'frame_annotations_{split}.jgz'
-
-        with gzip.open(os.path.join(data_root, split, frame_annotations_file), "rt", encoding="utf8") as zipfile:
-            frame_annots_list = load_dataclass(
-                zipfile, List[DynamicReplicaFrameAnnotation]
-            )
+        # Group by sequence_name -> camera_name -> [frame...]
         seq_annot = defaultdict(lambda: defaultdict(list))
-        for frame_annot in frame_annots_list:
-            seq_annot[frame_annot.sequence_name][frame_annot.camera_name].append(frame_annot)
+        for f in frame_annots_list:
+            seq_annot[f.sequence_name][f.camera_name].append(f)
 
-        def print_progress(i, total, result):
-            if i % max(1, math.ceil(total / 20)) == 0 or i == total - 1:
-                logger.info(f"Loaded {i + 1}/{total} ({(i + 1) / total * 100:.2f}%) sequences")
-            return result
+        # Sort frames within each (seq, cam) by frame_number for determinism
+        for seq, cams in seq_annot.items():
+            for cam in cams:
+                cams[cam].sort(key=lambda x: (x.frame_number if x.frame_number is not None
+                                              else x.image.path))
 
-        sample_list = []
+        # Apply seq_sample to the discovered sequences
+        all_seqs = sorted(seq_annot.keys())
+        b, e, s = seq_sample
+        seqs = all_seqs[b:e:s]
+        logger.info(f"Number of sequences used for {magenta(split.upper())}: "
+                    f"{len(seqs)} / {len(all_seqs)} -> {seqs}")
 
-        for seq_name in seq_annot.keys():
-            filenames = defaultdict(lambda: defaultdict(list))
-            for cam in ['left', 'right']:
-                for framedata in seq_annot[seq_name][cam]:
-                    im_path = os.path.join(data_root, split, framedata.image.path)
-                    depth_path = os.path.join(data_root, split, framedata.depth.path)
-                    mask_path = os.path.join(data_root, split, framedata.mask.path)
-
-                    assert os.path.isfile(im_path), im_path
-                    assert os.path.isfile(depth_path), depth_path
-                    assert os.path.isfile(mask_path), mask_path
-
-                    filenames['image'][cam].append(im_path)
-                    filenames['depth'][cam].append(depth_path)
-                    filenames['mask'][cam].append(mask_path)
-
-                    filenames['viewpoint'][cam].append(framedata.viewpoint)
-                    filenames['metadata'][cam].append([framedata.sequence_name, framedata.image.size])
-
-                    for k in filenames.keys():
-                        assert len(filenames[k][cam]) == len(filenames['image'][cam]) > 0, framedata.sequence_name
-
-            seq_len = len(filenames['image'][cam])
-            print('seq_len', seq_name, seq_len)
-
-            self.sample_len: int = -1  # TODO: or 50
-            step = self.sample_len if self.sample_len > 0 else seq_len
-            counter = 0
-
-            # TODO: use print progress
-            # TODO: save to output_list and parallelize loading
-            for ref_idx in range(0, seq_len, step):
-                sample_filenames = defaultdict(lambda: defaultdict(list))
-                for cam in ['left', 'right']:
-                    for idx in range(ref_idx, ref_idx + step):
-                        for k in filenames.keys():
-                            sample_filenames[k][cam].append(filenames[k][cam][idx])
-
-                sample_list.append(sample_filenames)
-                counter += 1
-
-                # TODO: remove this debug code
-        # For a quick run just check with the first sample
-        example = self.getitem_from_sample(sample_list[0])
-        output_list = [[example]]
-
-        # TODO: Activate the full run
-        # output_list = []
-        # for i, seq_data_root in enumerate(self.seq_data_roots):
-        #     logger.info(f'Loading "{seq_data_root}" camera poses from dynamic replica')
-
-        #     inputs = sample_list
-        #     outputs = parallel_execution(
-        #         inputs,
-        #         action=partial(
-        #             self.getitem_from_sample,
-        #         ),
-        #         print_progress=False,
-        #         callback=print_progress,
-        #     )
-        #     output_list.append(outputs)
-
-        total = len(seqs)
-        self.lengths = []
+        # ------------------------------------------------------------------
+        # Per-sequence pre-loading (mvaria-style: arrays in memory)
+        # ------------------------------------------------------------------
         self.seqs = dotdict()
+        self.lengths = []
 
-        # TODO: seq_data_roots is not used for dynamic replica, the first iteration could be removed
-        for i, (seq_data_root, outputs) in enumerate(
-                zip(self.seq_data_roots, output_list)
-        ):
-            logger.info(f'Parsing "{seq_data_root}" images')
+        cam = "left"  # 4DGT is mono
+        fb, fe, fs = frame_sample
 
-            for j, (key, output) in enumerate(zip(seqs, outputs)):
-                print('output', output.keys())  # ['viewpoint', 'metadata', 'img', 'disp', 'valid_disp', 'mask']
+        for key in seqs:
+            frames = seq_annot[key].get(cam, [])
+            if not frames:
+                logger.warn(f"Sequence {key} has no '{cam}' camera, skipping")
+                continue
 
-                ims = output['img']
+            # Sub-sample frames
+            fe_eff = len(frames) if fe is None else min(fe, len(frames))
+            frames = frames[fb:fe_eff:fs]
+            F = len(frames)
+            if F == 0:
+                logger.warn(f"Sequence {key} has 0 frames after frame_sample, skipping")
+                continue
 
-                # output["metadata"] [:] [0] (0 for left), is the tuple (name, image size (H, W))
-                Hs = [meta[0][1][0] for meta in output["metadata"]]
-                Ws = [meta[0][1][1] for meta in output["metadata"]]
+            ims_paths, Hs, Ws, Ks, RTs = [], [], [], [], []
+            for fr in frames:
+                im_path = os.path.join(data_root, split, fr.image.path)
+                if not os.path.isfile(im_path):
+                    raise FileNotFoundError(im_path)
+                H, W = int(fr.image.size[0]), int(fr.image.size[1])
+                vp = fr.viewpoint if isinstance(fr.viewpoint, dict) else {
+                    "R": fr.viewpoint.R,
+                    "T": fr.viewpoint.T,
+                    "focal_length": fr.viewpoint.focal_length,
+                    "principal_point": fr.viewpoint.principal_point,
+                    "intrinsics_format": fr.viewpoint.intrinsics_format,
+                }
+                K = _viewpoint_to_K_pixels(vp, (H, W))
+                RT = _viewpoint_to_RT_w2c(vp)
+                RT[:3, 3] /= loaded_to_meters
 
-                # output["viewpoint"] [:] is the camera parameters [0] for left, including R and T & K
-                ts = [viewpoint[0]["T"] for viewpoint in output["viewpoint"]]
-                RTs = [viewpoint[0]["R"] for viewpoint in output["viewpoint"]]
-                Ks = [viewpoint[0]["K"] for viewpoint in output["viewpoint"]]
+                ims_paths.append(im_path)
+                Hs.append(H); Ws.append(W); Ks.append(K); RTs.append(RT)
 
-                if not len(ims):
-                    logger.warn(f"Empty sequence {key}")
-                    continue
+            ims_paths = np.asarray(ims_paths)
+            Hs = np.asarray(Hs, dtype=np.int32)
+            Ws = np.asarray(Ws, dtype=np.int32)
+            Ks = np.stack(Ks).astype(np.float32)
+            RTs = np.stack(RTs).astype(np.float32)
 
-                if key not in self.seqs:
-                    self.seqs[key] = dotdict()
+            # Dynamic Replica frames are uniformly sampled; construct a synthetic
+            # timestamp from the frame index so 4DGT's time embedding works.
+            ts = (np.arange(F, dtype=np.float64)) / max(self.fps, 1e-6) / loaded_to_seconds
 
-                self.seqs[key][seq_data_root] = dotdict()
-                self.seqs[key][seq_data_root].ims = ims
-                self.seqs[key][seq_data_root].Hs = Hs
-                self.seqs[key][seq_data_root].Ws = Ws
-                self.seqs[key][seq_data_root].Ks = Ks
-                self.seqs[key][seq_data_root].RTs = RTs  # w2c
-                self.seqs[key][seq_data_root].ts = ts  # timestamps
+            # Use seq_data_roots[0] purely as a key (typically "")
+            sdr = self.seq_data_roots[0]
+            self.seqs[key] = dotdict()
+            self.seqs[key][sdr] = dotdict()
+            self.seqs[key][sdr].ims = ims_paths
+            self.seqs[key][sdr].Hs = Hs
+            self.seqs[key][sdr].Ws = Ws
+            self.seqs[key][sdr].Ks = Ks
+            self.seqs[key][sdr].RTs = RTs
+            self.seqs[key][sdr].ts = ts
 
-                # Load actual images
-                max_h = max(Hs)
-                max_w = max(Ws)
-                h, w = input_image_res
-
-                # Handle center crop and resizing
-                xs, ys = [], []
-                ws_list, hs_list = [], []
-                ratios = []
-
-                for idx in range(len(ims)):
-                    if Hs[idx] > Ws[idx]:
-                        ratio_x = w / Ws[idx]
-                        ratio_y = int(ratio_x * Hs[idx] + 0.5) / Hs[idx]
-                        ratio = ratio_x
-                    else:
-                        ratio_y = h / Hs[idx]
-                        ratio_x = int(ratio_y * Ws[idx] + 0.5) / Ws[idx]
-                        ratio = ratio_y
-
-                    if h / Hs[idx] > w / Ws[idx]:
-                        x, y = int((Ws[idx] * ratio_x - w + 0.5) // 2), 0
-                    else:
-                        x, y = 0, int((Hs[idx] * ratio_y - h + 0.5) // 2)
-
-                    Ks[idx, 0:1] *= ratio_x
-                    Ks[idx, 1:2] *= ratio_y
-                    Ks[idx, 0, 2] -= x
-                    Ks[idx, 1, 2] -= y
-                    xs.append(x)
-                    ys.append(y)
-                    ws_list.append(int(ratio_x * Ws[idx] + 0.5))
-                    hs_list.append(int(ratio_y * Hs[idx] + 0.5))
-                    Hs[idx] = h
-                    Ws[idx] = w
-                    ratios.append(ratio)
-
-                ratios = np.asarray(ratios)
-
-                # Load images
-                seq_path = os.path.join(data_root, key, seq_data_root) if seq_data_root else os.path.join(data_root,
-                                                                                                          key)
-                self.seqs[key][seq_data_root].ims_data = load_dynamic_replica_images(
-                    ims, seq_path, xs, ys, Ws, Hs, hs_list, ws_list
-                )
-
-                # Normalize images
-                self.seqs[key][seq_data_root].ims_data = self.seqs[key][
-                                                             seq_data_root].ims_data / 1.0  # Already in 0-1 range
-                self.seqs[key][seq_data_root].ims_data = self.seqs[key][
-                                                             seq_data_root].ims_data * 2 - 1  # Convert to -1 to 1
-
-                if j % max(1, math.ceil(total / 20)) == 0 or j == total - 1:
-                    logger.info(
-                        f"Parsed {j + 1}/{total} ({(j + 1) / total * 100:.2f}%) sequences"
-                    )
-
-                if i == 0:
-                    self.lengths.append(
-                        int(
-                            len(self.seqs[key][seq_data_root].ims)
-                            // self.sample_interval
-                        )
-                    )
+            # Number of windows of length batch_image_num that fit in this sequence.
+            n_windows = max(0, (F - self.batch_image_num) // self.sample_interval + 1)
+            self.lengths.append(n_windows)
 
         self.seq_keys = list(self.seqs.keys())
-        self.lengths = np.asarray(self.lengths)
+        self.lengths = np.asarray(self.lengths, dtype=np.int64)
         self.cumsum_lengths = [0] + self.lengths.cumsum(-1).tolist()
 
-        if len(self.seq_keys) > 0:
-            assert (
-                    len(self.seq_keys) == len(self.cumsum_lengths) - 1
-                    and len(self.seq_keys) == len(self.lengths)
-                    and len(self.seq_keys) == len(self.seqs)
-            ), f"Lengths mismatch: {len(self.seq_keys)}, {len(self.cumsum_lengths) - 1}, {len(self.lengths)}, {len(self.seqs)}"
-
+    # ----- Dataset API ---------------------------------------------------
     def __len__(self):
-        if not self.cumsum_lengths:
-            return 0
-        return self.cumsum_lengths[-1]
+        return int(self.cumsum_lengths[-1]) if self.cumsum_lengths else 0
 
-    def read_gen(self, file_name, pil=False):
-        ext = os.path.splitext(file_name)[-1]
-        if ext == ".png" or ext == ".jpeg" or ext == ".ppm" or ext == ".jpg":
-            from PIL import Image
-            return Image.open(file_name)
-        elif ext == ".bin" or ext == ".raw":
-            return np.load(file_name)
-        # elif ext == ".flo":
-        #     return os.path.readFlow(file_name).astype(np.float32)
-        elif ext == ".pfm":
-            flow = readPFM(file_name).astype(np.float32)
-            if len(flow.shape) == 2:
-                return flow
-            else:
-                return flow[:, :, :-1]
-        return []
-
-    def _get_output_tensor(self, sample):
-        output_tensor = defaultdict(list)
-        sample_size = len(sample["image"]["left"])
-        output_tensor_keys = ["img", "disp", "valid_disp", "mask"]
-        add_keys = ["viewpoint", "metadata"]
-        for add_key in add_keys:
-            if add_key in sample:
-                output_tensor_keys.append(add_key)
-
-        for key in output_tensor_keys:
-            output_tensor[key] = [[] for _ in range(sample_size)]
-
-        if "viewpoint" in sample:
-            # viewpoint_left = self._get_pytorch3d_camera(
-            #     sample["viewpoint"]["left"][0],
-            #     sample["metadata"]["left"][0][1],
-            #     scale=1.0,
-            # )
-            # viewpoint_right = self._get_pytorch3d_camera(
-            #     sample["viewpoint"]["right"][0],
-            #     sample["metadata"]["right"][0][1],
-            #     scale=1.0,
-            # )
-
-            # TODO: depth2disparity_scale
-            depth2disp_scale = 1  # depth2disparity_scale(
-            #     viewpoint_left,
-            #     viewpoint_right,
-            #     torch.Tensor(sample["metadata"]["left"][0][1])[None],
-            # )
-
-        for i in range(sample_size):
-            for cam in ["left", "right"]:
-                if "mask" in sample and cam in sample["mask"]:
-                    mask = self.read_gen(sample["mask"][cam][i])
-                    mask = np.array(mask) / 255.0
-                    output_tensor["mask"][i].append(mask)
-
-                if "viewpoint" in sample and cam in sample["viewpoint"]:
-                    #     viewpoint = self._get_pytorch3d_camera(
-                    #         sample["viewpoint"][cam][i],
-                    #         sample["metadata"][cam][i][1],
-                    #         scale=1.0,
-                    #     )
-
-                    entry_viewpoint = sample["viewpoint"][cam][i]
-                    image_size = sample["metadata"][cam][i][1]  # (H, W)
-                    scale = 1.0
-
-                    principal_point = torch.tensor(entry_viewpoint["principal_point"], dtype=torch.float)
-                    focal_length = torch.tensor(entry_viewpoint["focal_length"], dtype=torch.float)
-
-                    half_image_size_wh_orig = (
-                            torch.tensor(list(reversed(image_size)), dtype=torch.float) / 2.0
-                    )
-
-                    # first, we convert from the dataset's NDC convention to pixels
-                    format = entry_viewpoint["intrinsics_format"]
-                    if format.lower() == "ndc_norm_image_bounds":
-                        # this is e.g. currently used in CO3D for storing intrinsics
-                        rescale = half_image_size_wh_orig
-                    elif format.lower() == "ndc_isotropic":
-                        rescale = half_image_size_wh_orig.min()
-                    else:
-                        raise ValueError(f"Unknown intrinsics format: {format}")
-
-                    # principal point and focal length in pixels
-                    principal_point_px = half_image_size_wh_orig - principal_point * rescale
-                    focal_length_px = focal_length * rescale
-
-                    # now, convert from pixels to PyTorch3D v0.5+ NDC convention
-                    # if self.image_height is None or self.image_width is None:
-                    out_size = list(reversed(image_size))
-
-                    half_image_size_output = torch.tensor(out_size, dtype=torch.float) / 2.0
-                    half_min_image_size_output = half_image_size_output.min()
-
-                    # rescaled principal point and focal length in ndc
-                    principal_point = (
-                                              half_image_size_output - principal_point_px * scale
-                                      ) / half_min_image_size_output
-                    focal_length = focal_length_px * scale / half_min_image_size_output
-
-                    viewpoint = {
-                        "R": torch.tensor(sample["viewpoint"][cam][i]["R"], dtype=torch.float)[None],
-                        "T": torch.tensor(sample["viewpoint"][cam][i]["T"], dtype=torch.float)[None],
-                        "K": torch.tensor([
-                            [focal_length[0], 0, principal_point[0]],
-                            [0, focal_length[1], principal_point[1]],
-                            [0, 0, 1],
-                        ], dtype=torch.float)
-                    }
-                    output_tensor["viewpoint"][i].append(viewpoint)
-
-                if "metadata" in sample and cam in sample["metadata"]:
-                    metadata = sample["metadata"][cam][i]
-                    output_tensor["metadata"][i].append(metadata)
-
-                if cam in sample["image"]:
-
-                    img = self.read_gen(sample["image"][cam][i])
-                    img = np.array(img).astype(np.uint8)
-
-                    # grayscale images
-                    if len(img.shape) == 2:
-                        img = np.tile(img[..., None], (1, 1, 3))
-                    else:
-                        img = img[..., :3]
-                    output_tensor["img"][i].append(img)
-
-                if cam in sample["disparity"]:
-                    disp = self.disparity_reader(sample["disparity"][cam][i])
-                    if isinstance(disp, tuple):
-                        disp, valid_disp = disp
-                    else:
-                        valid_disp = disp < 512
-                    disp = np.array(disp).astype(np.float32)
-
-                    disp = np.stack([-disp, np.zeros_like(disp)], axis=-1)
-
-                    output_tensor["disp"][i].append(disp)
-                    output_tensor["valid_disp"][i].append(valid_disp)
-
-                elif "depth" in sample and cam in sample["depth"]:
-                    depth = load_16big_png_depth(sample["depth"][cam][i])
-
-                    depth_eps = 1e-5
-                    depth_mask = depth < depth_eps
-                    depth[depth_mask] = depth_eps
-
-                    disp = depth2disp_scale / depth
-                    disp[depth_mask] = 0
-                    valid_disp = (disp < 512) * (1 - depth_mask)
-
-                    disp = np.array(disp).astype(np.float32)
-                    disp = np.stack([-disp, np.zeros_like(disp)], axis=-1)
-                    output_tensor["disp"][i].append(disp)
-                    output_tensor["valid_disp"][i].append(valid_disp)
-
-        return output_tensor
-
-    def getitem_from_sample(self, sample):
-        output_tensor = self._get_output_tensor(sample)
-
-        sample_size = len(sample["image"]["left"])
-
-        # TODO: check if we need augmentor
-        # if self.augmentor is not None:
-        #     output_tensor["img"], output_tensor["disp"] = self.augmentor(
-        #         output_tensor["img"], output_tensor["disp"]
-        #     )
-        for i in range(sample_size):
-            for cam in (0, 1):
-                if cam < len(output_tensor["img"][i]):
-                    img = (
-                        torch.from_numpy(output_tensor["img"][i][cam])
-                        .permute(2, 0, 1)
-                        .float()
-                    )
-                    # TODO: img padding
-                    # if self.img_pad is not None:
-                    #     padH, padW = self.img_pad
-                    #     img = F.pad(img, [padW] * 2 + [padH] * 2)
-                    output_tensor["img"][i][cam] = img
-
-                if cam < len(output_tensor["disp"][i]):
-                    disp = (
-                        torch.from_numpy(output_tensor["disp"][i][cam])
-                        .permute(2, 0, 1)
-                        .float()
-                    )
-
-                    valid_disp = (
-                            (disp[0].abs() < 512)
-                            & (disp[1].abs() < 512)
-                            & (disp[0].abs() != 0)
-                    )
-                    disp = disp[:1]
-
-                    output_tensor["disp"][i][cam] = disp
-                    output_tensor["valid_disp"][i][cam] = valid_disp.float()
-
-                if "mask" in output_tensor and cam < len(output_tensor["mask"][i]):
-                    mask = torch.from_numpy(output_tensor["mask"][i][cam]).float()
-                    output_tensor["mask"][i][cam] = mask
-
-                if "viewpoint" in output_tensor and cam < len(
-                        output_tensor["viewpoint"][i]
-                ):
-                    viewpoint = output_tensor["viewpoint"][i][cam]
-                    output_tensor["viewpoint"][i][cam] = viewpoint
-
-        res = {}
-        if "viewpoint" in output_tensor:
-            res["viewpoint"] = output_tensor["viewpoint"]
-        if "metadata" in output_tensor:
-            res["metadata"] = output_tensor["metadata"]
-
-        for k, v in output_tensor.items():
-            if k != "viewpoint" and k != "metadata":
-                for i in range(len(v)):
-                    if len(v[i]) > 0:
-                        v[i] = torch.stack(v[i])
-                if len(v) > 0 and (len(v[0]) > 0):
-                    res[k] = torch.stack(v)
-        return res
-
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int):  # noqa: C901
         if len(self) == 0:
             raise IndexError("Dataset is empty")
-
         idx = idx % self.cumsum_lengths[-1]
-
         seq_idx = np.searchsorted(self.cumsum_lengths, idx, side="right").item() - 1
         key = self.seq_keys[seq_idx]
         sub_idx = idx - self.cumsum_lengths[seq_idx]
         global_abs_start_ind = sub_idx * self.sample_interval
 
-        rgb_input = []
-        rgb_output = []
-        rays_t_un_input = []
-        rays_t_un_output = []
-        cameras_input = []
-        cameras_output = []
-        img_name_output = []
-        ratios_output = []
+        sdr = self.seq_data_roots[0]
+        seq = self.seqs[key][sdr]
+        curr_len = len(seq.ts)
+
+        rgb_input, rgb_output = [], []
+        rays_t_un_input, rays_t_un_output = [], []
+        cameras_input, cameras_output = [], []
+        img_name_output, ratios_output = [], []
         c2w_avg = None
 
-        vb, ve, vs = self.view_sample
-        fb, _, fs = self.novel_time_frame_sample
-        inputs = np.arange(len(self.seq_data_roots))[vb:ve:vs]
-        n_inputs = len(inputs)
+        # 4DGT mono: a single seq_data_root, treated as "input" and "output".
+        target_num_images = self.batch_image_num
+        abs_start_ind = max(0, min(global_abs_start_ind, curr_len - target_num_images))
+        abs_end_ind = abs_start_ind + target_num_images
+        sample_inds = np.arange(abs_start_ind, abs_end_ind)
 
-        for i, seq_data_root in enumerate(self.seq_data_roots):
-            curr_len = len(self.seqs[key][seq_data_root].ts)
-            pre = os.path.join(self.data_root, key, seq_data_root) if seq_data_root else os.path.join(self.data_root,
-                                                                                                      key)
-            is_input = i in inputs
+        ims = seq.ims[sample_inds].copy()
+        Hs = seq.Hs[sample_inds].copy()
+        Ws = seq.Ws[sample_inds].copy()
+        Ks = seq.Ks[sample_inds].copy()
+        RTs = seq.RTs[sample_inds].copy()
+        ts = seq.ts[sample_inds].copy()
 
-            input_sampling_starting_offset = max(
-                (fs // n_inputs) * (i - n_inputs // 2), -fb
-            )
-            dist = 1
-            abs_start_ind = global_abs_start_ind
-            abs_end_ind = global_abs_start_ind + self.batch_image_num * dist
-            target_num_images = self.batch_image_num
+        ts -= ts.min()
+        ts = ts.astype(np.float32)
 
-            if i != 0:
-                abs_end_ind = min(curr_len, abs_end_ind)
-                start = self.seqs[key][self.seq_data_roots[0]].ts[abs_start_ind]
-                end = self.seqs[key][self.seq_data_roots[0]].ts[abs_end_ind - 1]
-                ts = self.seqs[key][seq_data_root].ts
-                abs_start_ind = np.searchsorted(ts, start, side="left")
-                abs_end_ind = np.searchsorted(ts, end, side="left")
-                target_num_images = abs_end_ind - abs_start_ind
+        # Letterbox/resize to input_image_res, then center-crop to (h, w) – mvaria-style.
+        h, w = self.input_image_res
+        xs, ys, ws_list, hs_list, ratios = [], [], [], [], []
+        for i in range(len(ims)):
+            if Hs[i] > Ws[i]:
+                ratio_x = w / Ws[i]
+                ratio_y = int(ratio_x * Hs[i] + 0.5) / Hs[i]
+                ratio = ratio_x
+            else:
+                ratio_y = h / Hs[i]
+                ratio_x = int(ratio_y * Ws[i] + 0.5) / Ws[i]
+                ratio = ratio_y
+            if h / Hs[i] > w / Ws[i]:
+                x = int((Ws[i] * ratio_x - w + 0.5) // 2); y = 0
+            else:
+                x = 0; y = int((Hs[i] * ratio_y - h + 0.5) // 2)
+            Ks[i, 0:1] *= ratio_x
+            Ks[i, 1:2] *= ratio_y
+            Ks[i, 0, 2] -= x
+            Ks[i, 1, 2] -= y
+            xs.append(x); ys.append(y)
+            ws_list.append(int(ratio_x * Ws[i] + 0.5))
+            hs_list.append(int(ratio_y * Hs[i] + 0.5))
+            Hs[i] = h; Ws[i] = w
+            ratios.append(ratio)
+        ratios = np.asarray(ratios, dtype=np.float32)
 
-            abs_end_ind = min(curr_len, abs_end_ind)
-            abs_start_ind = min(abs_start_ind, abs_end_ind - target_num_images)
-            abs_start_ind = max(0, abs_start_ind)
+        imgs = load_dynamic_replica_images(ims, xs, ys, Ws, Hs, hs_list, ws_list)
+        imgs = imgs * 2.0 - 1.0                      # [-1, 1]
+        imgs = np.transpose(imgs, (0, 3, 1, 2))      # NHWC -> NCHW
 
-            sample_inds = np.arange(abs_start_ind, abs_end_ind, dist)
-            if len(sample_inds) != target_num_images:
-                sample_inds = sample_inds[:target_num_images]
+        c2ws = as_numpy_func(affine_inverse)(RTs)
+        if self.align_cameras:
+            c2w_avg = average_c2ws(c2ws, align_cameras=False, look_at_center=True)
+            c2ws = align_c2ws(c2ws, c2w_avg)
+        c2ws = as_numpy_func(affine_padding)(c2ws)
+        cameras = pack_c2ws_to_cameras(c2ws, Ks, Hs, Ws)
 
-            ims = self.seqs[key][seq_data_root].ims[sample_inds].copy()
-            Hs = self.seqs[key][seq_data_root].Hs[sample_inds].copy()
-            Ws = self.seqs[key][seq_data_root].Ws[sample_inds].copy()
-            Ks = self.seqs[key][seq_data_root].Ks[sample_inds].copy()
-            RTs = self.seqs[key][seq_data_root].RTs[sample_inds].copy()
-            ts = self.seqs[key][seq_data_root].ts[sample_inds].copy()
-            imgs = self.seqs[key][seq_data_root].ims_data[sample_inds].copy()
+        # Input / output index selection
+        if self.novel_time_sampling:
+            fb, _, fs = self.novel_time_frame_sample
+            input_inds = np.arange(fb, len(imgs), fs)
+        else:
+            input_inds = np.arange(len(imgs))
+        output_inds = np.arange(len(imgs))
 
-            ts -= ts.min()
-            ts = ts.astype(np.float32)
-
-            # Convert images to NCHW format
-            if len(imgs.shape) == 3:
-                imgs = np.transpose(imgs[None], (0, 3, 1, 2))[0]
-            elif len(imgs.shape) == 4:
-                imgs = np.transpose(imgs, (0, 3, 1, 2))
-
-            # Convert pose matrices
-            c2ws = as_numpy_func(affine_inverse)(RTs)
-
-            if self.align_cameras and c2w_avg is None:
-                c2w_avg = average_c2ws(
-                    as_numpy_func(affine_inverse)(RTs),
-                    align_cameras=False,
-                    look_at_center=True,
-                )
-
-            if c2w_avg is not None:
-                c2ws = align_c2ws(c2ws, c2w_avg)
-                c2ws = as_numpy_func(affine_padding)(c2ws)
-
-            # Pack cameras
-            from .utils import pack_c2ws_to_cameras
-            cameras = pack_c2ws_to_cameras(c2ws, Ks, Hs, Ws)
-
-            if is_input:
-                if self.novel_time_sampling:
-                    b, e, s = self.novel_time_frame_sample
-                    b = b + input_sampling_starting_offset
-                    e = len(imgs)
-                    inds = np.arange(b, e, s)
-                else:
-                    inds = np.arange(len(imgs))
-
-                imgs_input = imgs[inds]
-                cams_input = cameras[inds]
-
-                rgb_input.append(imgs_input)
-                cameras_input.append(cams_input)
-                rays_t_un_input.append(ts[inds])
-
-            inds = np.arange(len(imgs))
-
-            rgb_output.append(imgs[inds])
-            rays_t_un_output.append(ts[inds])
-            cameras_output.append(cameras[inds])
-            img_name_output.append(
-                np.asarray([os.path.join(key, seq_data_root, im) if seq_data_root else os.path.join(key, im) for im in
-                            ims[inds]])
-            )
-            ratios_output.append(np.ones(len(ims[inds]), dtype=np.float32))
+        rgb_input.append(imgs[input_inds])
+        cameras_input.append(cameras[input_inds])
+        rays_t_un_input.append(ts[input_inds])
+        rgb_output.append(imgs[output_inds])
+        cameras_output.append(cameras[output_inds])
+        rays_t_un_output.append(ts[output_inds])
+        img_name_output.append(np.asarray([ims[i] for i in output_inds]))
+        ratios_output.append(ratios[output_inds])
 
         batch = dotdict()
-        batch.rgb_input = np.concatenate(rgb_input).astype(np.float32) if rgb_input else np.array([]).astype(np.float32)
-        batch.rays_t_un_input = np.concatenate(rays_t_un_input).astype(np.float32) if rays_t_un_input else np.array(
-            []).astype(np.float32)
-        batch.cameras_input = np.concatenate(cameras_input).astype(np.float32) if cameras_input else np.array(
-            []).astype(np.float32)
+        batch.rgb_input = np.concatenate(rgb_input).astype(np.float32)
+        batch.rays_t_un_input = np.concatenate(rays_t_un_input).astype(np.float32)
+        batch.cameras_input = np.concatenate(cameras_input).astype(np.float32)
         batch.rgb_output = np.concatenate(rgb_output).astype(np.float32)
         batch.rays_t_un_output = np.concatenate(rays_t_un_output).astype(np.float32)
         batch.cameras_output = np.concatenate(cameras_output).astype(np.float32)
-        batch.img_name_output = np.concatenate(img_name_output)
+        batch.img_name_output = np.concatenate(img_name_output).tolist()
         batch.ratios_output = np.concatenate(ratios_output).astype(np.float32)
-
-        batch.img_name_output = batch.img_name_output.tolist()
-        batch.c2w_avg = c2w_avg if c2w_avg is not None else np.eye(4)
-
+        batch.c2w_avg = c2w_avg if c2w_avg is not None else np.eye(4, dtype=np.float32)
         return batch
