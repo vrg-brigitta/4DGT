@@ -117,6 +117,15 @@ bash tlod/scripts/run_vrs_preprocessing.sh
 
 After this, you should have a `data/adt/Apartment_release_multiuser_cook_seq141_M1292/synthetic_video/camera-rgb-rectified-600-h1000` folder corresponding to the format discussed above.
 
+## Dynamic Replica dataset
+
+Download following the instructions in the [DynamicReplica](https://dynamic-stereo.github.io) dataset's own repository.
+Then the data loader can be tested using the following command and the correct data-root
+
+```bash
+python -m tlod.data_loader.test_datasets --data-root 'data/dynamic_replica'
+```
+
 ## Inference
 
 We provide a simplified Python interface with cleaner configuration. During execution, each batch waits for the previous one to complete: the model encoder generates Gaussians, the renderer processes them, then saves to disk—all in sequence. Rendering all 128 frames will take some time to complete.
@@ -129,6 +138,10 @@ python -m tlod.run \
     seq_list=loc3_script3_seq1_rec1 \
     seq_data_root=recording/camera-rgb-rectified-600-h1000 \
     novel_view_timestamps="[1.42222, 2.84444]" 
+
+python -m tlod.run data_path=data/aea seq_list=loc3_script3_seq1_rec1 seq_data_root=recording/camera-rgb-rectified-600-h1000 novel_view_timestamps="[1.42222, 2.84444]" image_num_per_batch=64 num_workers=0 persistent_workers=false
+
+python -m tlod.run data_path=C:\\Development\\AI\\CV2\\dynamic_stereo\\dynamic_replica_data\\test dataset_type=dynamic_replica image_num_per_batch=64 num_workers=0 persistent_workers=false
 
 # Run inference on the above ADT sequence 
 # Frame sample indicates running only on the last 128 frames.

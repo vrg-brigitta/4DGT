@@ -11,6 +11,7 @@ extra invariants specific to Dynamic Replica:
   - all batch tensors have matching first dim
 """
 
+import argparse
 import os
 import numpy as np
 import torch
@@ -95,7 +96,7 @@ def _check_batch_invariants(batch, batch_size: int, F_in: int, F_out: int,
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-def test_dynamic_replica_data_loader():
+def test_dynamic_replica_data_loader(data_root):
     """Single 300-frame VALID sequence, 8-frame windows, batch=6.
 
     F=300, batch_image_num=8, sample_interval=1 -> n_windows = 293 per sequence
@@ -108,7 +109,7 @@ def test_dynamic_replica_data_loader():
 
     dataset = DynamicReplicaDataset(
         mode="VAL",
-        data_root="/mnt/d/dynamic-stereo/dynamic_stereo/dynamic_replica_data",
+        data_root=data_root,
         seq_sample=(0, 1, 1),
         frame_sample=(0, 300, 1),
         input_image_num=input_image_num,
@@ -144,12 +145,12 @@ def test_dynamic_replica_data_loader():
             break  # 2 batches is enough for a smoke test
 
 
-def test_dynamic_replica_novel_time():
+def test_dynamic_replica_novel_time(data_root):
     """Same data but with novel_time_sampling=True so input_inds < output_inds."""
     H = W = 256
     dataset = DynamicReplicaDataset(
         mode="VAL",
-        data_root="/mnt/d/dynamic-stereo/dynamic_stereo/dynamic_replica_data",
+        data_root=data_root,
         seq_sample=(0, 1, 1),
         frame_sample=(0, 300, 1),
         input_image_num=8,
@@ -180,7 +181,11 @@ def test_mvaria_data_loader():
 
 
 if __name__ == "__main__":
-    test_dynamic_replica_data_loader()
-    test_dynamic_replica_novel_time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=str, default="/mnt/d/dynamic-stereo/dynamic_stereo/dynamic_replica_data")
+    args = parser.parse_args()
+
+    test_dynamic_replica_data_loader(data_root=args.data_root)
+    test_dynamic_replica_novel_time(data_root=args.data_root)
     # test_mvaria_data_loader()
     print("Everything passed")
