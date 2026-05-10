@@ -169,6 +169,14 @@ python -m tlod.run \
     novel_view_timestamps="[1.42222, 2.84444]"
 ```
 
+## Evaluation
+
+PSNR, LPIPS, RMSE, and normal angle error (deg)
+```bash
+python .\evaluate_dynamic_replica.py --data-root .\data\dynamicreplica\ --mode test --checkpoint checkpoints/4dgt_full.pth --config configs/models/tlod.py
+```
+
+
 ## GUI & Interactive Viewer
 
 We provide a simple interactive web-based viewer that renders Gaussians with asynchronous Gaussian generation:
