@@ -59,8 +59,9 @@ def compute_rmse(gt: torch.Tensor, pred: torch.Tensor) -> float:
 def compute_lpips_score(lpips_model: lpips.LPIPS, gt: torch.Tensor, pred: torch.Tensor) -> float:
     """Compute LPIPS perceptual similarity score."""
     # lpips expects [1, 3, H, W] in [0,1]
+    device = next(lpips_model.parameters()).device
     with torch.no_grad():
-        score = lpips_model(gt.unsqueeze(0).cpu(), pred.unsqueeze(0).cpu())
+        score = lpips_model(gt.unsqueeze(0).to(device), pred.unsqueeze(0).to(device))
     return float(score.squeeze().item())
 
 
@@ -238,7 +239,10 @@ def evaluate_subsequence(
         pred_normals = output["normal"].detach().cpu()
         normals_deg = []
         for idx, img_name in enumerate(img_names):
-            depth_info = depth_annotation_map.get(img_name)
+            img_name_str = img_name[0] if isinstance(img_name, list) else img_name
+            print(f"Evaluating normals for {img_name_str}...")
+            depth_info = depth_annotation_map.get(img_name_str)
+
             if depth_info is None:
                 continue
             depth_path = depth_info["depth_path"]

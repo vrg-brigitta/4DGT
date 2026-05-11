@@ -20,12 +20,14 @@ import argparse
 import gzip
 import os
 import time
+from pathlib import Path
 from typing import Dict, List
 
 import lpips
 import torch
 from torch.utils.data import DataLoader
 
+from tlod.download_model import download_4dgt_model
 from evaluate_core import (
     evaluate_subsequence,
     format_results,
@@ -42,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate 4DGT on Dynamic Replica dataset")
     parser.add_argument("--data-root", required=True, help="Root folder for Dynamic Replica data")
     parser.add_argument("--checkpoint", required=True, help="Path to the trained 4DGT checkpoint")
-    parser.add_argument("--config", required=True, help="Path to the model config file")
+    parser.add_argument("--config", default="configs/models/tlod-l3.py", help="Path to the model config file")
     parser.add_argument("--mode", default="test", choices=["test", "valid", "train"], help="Dataset split")
     parser.add_argument("--device", default="cuda", help="Compute device")
     parser.add_argument("--resolution", type=int, default=504, help="Target image height and width for evaluation")
@@ -124,9 +126,19 @@ def main() -> None:
     device = args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     torch.set_grad_enabled(False)
 
+    # ------------------------------------------------------------------
+    # 1. Make sure the checkpoint exists; auto-download if missing.
+    # ------------------------------------------------------------------
+    ckpt = Path(args.checkpoint)
+    if not ckpt.exists():
+        print(f"[info] {ckpt} not found, downloading from HF...")
+        ckpt = Path(download_4dgt_model(output_dir=ckpt.parent, filename=ckpt.name))
+        print(f"[info] downloaded to {ckpt}")
+
     dataset = build_dataset(args)
     dataloader = build_dataloader(dataset, args.num_workers)
     annotation_map = load_depth_annotation_map(args.data_root, args.mode)
+    print(f"Depth annotation map: {len(annotation_map)} entries")
 
     demo = FourDGTDemo(
         config_path=args.config,

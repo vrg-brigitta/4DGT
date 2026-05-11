@@ -12,12 +12,16 @@ extra invariants specific to Dynamic Replica:
 """
 
 import argparse
+import gzip
 import os
+from typing import List
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from tlod.data_loader.dynamic_replica_dataset import DynamicReplicaDataset
+from tlod.data_loader.dynamic_replica_dataset import DynamicReplicaFrameAnnotation, load_dataclass
 from tlod.data_loader.mvaria_dataset import AriaDataset
 
 
@@ -180,6 +184,30 @@ def test_mvaria_data_loader():
         break
 
 
+def test_depth_map(data_root="/mnt/d/dynamic-stereo/dynamic_stereo/dynamic_replica_data", mode="test"):
+    annotation_path = os.path.join(data_root, mode, f"frame_annotations_{mode}.jgz")
+    print(f"Annotation file exists: {os.path.isfile(annotation_path)}")
+
+    with gzip.open(annotation_path, "rt", encoding="utf8") as f:
+        frames = load_dataclass(f, List[DynamicReplicaFrameAnnotation])
+
+    print(f"Total frames in annotation: {len(frames)}")
+    print(f"Frames with depth: {sum(1 for fr in frames if fr.depth is not None)}")
+    print(f"Frames without depth: {sum(1 for fr in frames if fr.depth is None)}")
+
+    # Show a sample entry
+    sample = next((fr for fr in frames if fr.depth is not None), None)
+    if sample:
+        img_path = os.path.join(data_root, mode, sample.image.path)
+        depth_path = os.path.join(data_root, mode, sample.depth.path)
+        print(f"\nSample image path:  {img_path}")
+        print(f"Image size: {sample.image.size}")
+        print(f"Sample depth path:  {depth_path}")
+        print(f"Image file exists:  {os.path.isfile(img_path)}")
+        print(f"Depth file exists:  {os.path.isfile(depth_path)}")
+        print(f"Depth annotation:   path={sample.depth.path!r}  size={sample.depth.size}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, default="/mnt/d/dynamic-stereo/dynamic_stereo/dynamic_replica_data")
@@ -187,5 +215,6 @@ if __name__ == "__main__":
 
     test_dynamic_replica_data_loader(data_root=args.data_root)
     test_dynamic_replica_novel_time(data_root=args.data_root)
+    test_depth_map(data_root=args.data_root, mode="test")
     # test_mvaria_data_loader()
     print("Everything passed")
