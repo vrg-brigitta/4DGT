@@ -49,7 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Compute device")
     parser.add_argument("--resolution", type=int, default=504, help="Target image height and width for evaluation")
     parser.add_argument("--subsequence-length", type=int, default=128, help="Frame subsequence length")
-    parser.add_argument("--input-frames", type=int, default=64, help="Number of input frames used for conditioning")
+    parser.add_argument("--novel-time-stride", type=int, default=2,
+                        help="Stride for input frame sampling within each window. "
+                             "2 = every other frame as input (64 input / 64 test), matching the paper protocol.")
     parser.add_argument("--sample-interval", type=int, default=128, help="Window stride for non-overlapping subsequences")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers")
     parser.add_argument("--max-subsequences", type=int, default=None, help="Maximum number of subsequences to evaluate")
@@ -70,8 +72,8 @@ def build_dataset(args: argparse.Namespace) -> DynamicReplicaDataset:
         frame_sample=(0, None, 1),
         view_sample=(0, 1, 1),
         sample_interval=max(1, args.sample_interval),
-        novel_time_sampling=False,
-        novel_time_frame_sample=(0, None, 1),
+        novel_time_sampling=True,
+        novel_time_frame_sample=(0, None, args.novel_time_stride),
         novel_view_interp_input=False,
         novel_view_timestamps=(),
         novel_view_spiral_window=32,
@@ -110,18 +112,29 @@ def load_depth_annotation_map(data_root: str, mode: str) -> Dict[str, Dict[str, 
             continue
         image_path = os.path.join(data_root, mode, fr.image.path)
         depth_path = os.path.join(data_root, mode, fr.depth.path)
+
+        # image.size is Optional and is None in some Dynamic Replica releases.
+        # Fall back to the depth file's actual pixel dimensions via PIL (header
+        # only — no pixel decoding) so we never crash on missing metadata.
+        if fr.image.size is not None:
+            h, w = int(fr.image.size[0]), int(fr.image.size[1])
+        else:
+            from PIL import Image
+            with Image.open(depth_path) as _im:
+                w, h = _im.size  # PIL gives (W, H)
+
         mapping[image_path] = {
             "depth_path": depth_path,
-            "height": int(fr.image.size[0]),
-            "width": int(fr.image.size[1]),
+            "height": h,
+            "width": w,
         }
     return mapping
 
 
 def main() -> None:
     args = parse_args()
-    if args.input_frames >= args.subsequence_length:
-        raise ValueError("input_frames must be smaller than subsequence_length")
+    if args.novel_time_stride < 1 or args.subsequence_length % args.novel_time_stride != 0:
+        raise ValueError("novel_time_stride must divide subsequence_length evenly")
 
     device = args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     torch.set_grad_enabled(False)
@@ -170,9 +183,9 @@ def main() -> None:
         if isinstance(batch, list):
             batch = batch[0]
 
-        if len(batch.rgb_input.shape) < 5:
+        if len(batch.rgb_output.shape) < 5:
             raise ValueError("Batch data must include 5D rgb tensors")
-        if batch.rgb_input.shape[1] != args.subsequence_length:
+        if batch.rgb_output.shape[1] != args.subsequence_length:
             continue
 
         metrics = evaluate_subsequence(demo, batch, lpips_model, annotation_map, args)
