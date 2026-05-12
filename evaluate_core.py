@@ -328,9 +328,14 @@ def evaluate_subsequence(
 
 def format_results(results: Dict[str, list], args: argparse.Namespace) -> str:
     """Format evaluation results for display."""
+    stride = getattr(args, "novel_time_stride", 2)
+    n_total = args.subsequence_length
+    n_input = len(range(0, n_total, stride))
+    n_test = n_total - n_input
+
     lines = ["Evaluation results:"]
-    lines.append(f"  subsequence length: {args.subsequence_length}")
-    lines.append(f"  input frames: {args.input_frames}")
+    lines.append(f"  subsequence length: {n_total}")
+    lines.append(f"  novel_time_stride:  {stride}  ({n_input} input / {n_test} test frames)")
     lines.append(f"  evaluation resolution: {args.resolution}x{args.resolution}")
     lines.append(f"  evaluated subsequences: {len(results['psnr'])}")
     fmt = {"psnr": ".3f", "rmse": ".4f", "lpips": ".4f", "deg": ".3f",
