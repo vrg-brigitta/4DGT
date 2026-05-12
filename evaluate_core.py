@@ -163,6 +163,32 @@ def compute_normal_deg_error(pred_normals: torch.Tensor, gt_normals: np.ndarray,
     return float(np.nanmean(angle_deg)) if angle_deg.size else float("nan")
 
 
+def _z_to_euclidean(
+    z_depth: np.ndarray,
+    intrinsics: Tuple[float, float, float, float],
+) -> np.ndarray:
+    """Convert z-depth (along camera axis) to euclidean (ray) depth.
+
+    Dynamic Replica stores geometric/euclidean depth: the distance from the
+    camera centre to the surface point along the ray.  The renderer produces
+    z-depth: the perpendicular distance to the image plane.  The conversion is:
+
+        euclidean = z * sqrt(((u - cx)/fx)^2 + ((v - cy)/fy)^2 + 1)
+
+    Args:
+        z_depth: (H, W) array of z-depths in metres.
+        intrinsics: (fx, fy, cx, cy) in pixels.
+
+    Returns:
+        (H, W) array of euclidean depths in metres.
+    """
+    fx, fy, cx, cy = intrinsics
+    h, w = z_depth.shape
+    us, vs = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    ray_lengths = np.sqrt(((us - cx) / fx) ** 2 + ((vs - cy) / fy) ** 2 + 1.0)
+    return z_depth * ray_lengths
+
+
 def evaluate_subsequence(
     demo: FourDGTDemo,
     batch: object,
@@ -183,24 +209,36 @@ def evaluate_subsequence(
         Dictionary with metrics: psnr, rmse, lpips, deg, time_s, time_per_frame_s
     """
     import time
-    
-    input_frames = args.input_frames
-    output_frames = args.subsequence_length - args.input_frames
-    rgb_input = batch.rgb_input[:, :input_frames]
-    cameras_input = batch.cameras_input[:, :input_frames]
-    timestamps_input = batch.rays_t_un_input[:, :input_frames]
-    rgb_gt = batch.rgb_output[:, input_frames:]
-    cameras_output = batch.cameras_output[:, input_frames:]
-    timestamps_output = batch.rays_t_un_output[:, input_frames:]
-    img_names = batch.img_name_output[input_frames:]
-    ratios = batch.ratios_output[:, input_frames:]
+
+    stride = getattr(args, 'novel_time_stride', 2)
+    n_total = batch.rgb_output.shape[1]  # e.g. 128
+
+    # Input frames: every `stride`-th frame (dataset already did this subsampling,
+    # so batch.rgb_input contains only those frames).
+    # Output: ALL n_total frames rendered by the model.
+    # Test frames: the frames NOT given as input — used for metric computation.
+    input_frame_inds = set(range(0, n_total, stride))         # {0, 2, 4, ..., 126}
+    test_frame_inds  = [i for i in range(n_total)
+                        if i not in input_frame_inds]         # [1, 3, 5, ..., 127]
+
+    rgb_input         = batch.rgb_input                        # [B, n_total/stride, 3, H, W]
+    cameras_input     = batch.cameras_input                    # [B, n_total/stride, 20]
+    timestamps_input  = batch.rays_t_un_input                  # [B, n_total/stride]
+
+    cameras_output    = batch.cameras_output                   # [B, n_total, 20]
+    timestamps_output = batch.rays_t_un_output                 # [B, n_total]
+
+    # Ground truth and names only for test frames
+    rgb_gt   = batch.rgb_output[:, test_frame_inds]           # [B, n_test, 3, H, W]
+    img_names = [batch.img_name_output[i] for i in test_frame_inds]
+    cameras_test = cameras_output[:, test_frame_inds]         # [B, n_test, 20]
 
     start_time = time.perf_counter()
     output = demo.run_inference(
         images_input=rgb_input,
         cameras_input=cameras_input,
         timestamps_input=timestamps_input,
-        cameras_output=cameras_output,
+        cameras_output=cameras_output,        # render ALL frames
         timestamps_output=timestamps_output,
         render_mode="RGB+ED",
         sequential_render=False,
@@ -209,18 +247,16 @@ def evaluate_subsequence(
     )
     elapsed = time.perf_counter() - start_time
 
-    rgb_pred = normalize_rgb_tensor(output["rgb"][0].detach())
-    rgb_gt_tensor = normalize_rgb_tensor(rgb_gt[0])
-    rgb_pred = rgb_pred.cpu()
-    rgb_gt_tensor = rgb_gt_tensor.cpu()
+    # Select test-frame predictions from the full output (model rendered all frames).
+    rgb_pred_all = normalize_rgb_tensor(output["rgb"][0].detach())  # [n_total, 3, H, W]
+    rgb_pred      = rgb_pred_all[test_frame_inds].cpu()             # [n_test,  3, H, W]
+    rgb_gt_tensor = normalize_rgb_tensor(rgb_gt[0]).cpu()           # [n_test,  3, H, W]
 
     batch_psnr = 0.0
-    batch_rmse = 0.0
     batch_lpips = 0.0
     frame_count = rgb_pred.shape[0]
     for frame_idx in range(frame_count):
         batch_psnr += compute_psnr(rgb_gt_tensor[frame_idx], rgb_pred[frame_idx])
-        batch_rmse += compute_rmse(rgb_gt_tensor[frame_idx], rgb_pred[frame_idx])
         batch_lpips += compute_lpips_score(
             lpips_model,
             rgb_gt_tensor[frame_idx],
@@ -229,51 +265,87 @@ def evaluate_subsequence(
 
     results = {
         "psnr": batch_psnr / frame_count,
-        "rmse": batch_rmse / frame_count,
         "lpips": batch_lpips / frame_count,
         "time_s": elapsed,
         "time_per_frame_s": elapsed / frame_count,
     }
 
-    if "normal" in output and depth_annotation_map:
-        pred_normals = output["normal"].detach().cpu()
-        normals_deg = []
+    # Depth RMSE (metric, in metres) and normal degree error.
+    # Both require GT depth from the annotation map; load it once per frame and
+    # use it for both metrics so we don't read each depth file twice.
+    depth_rmses: list = []
+    normals_deg: list = []
+
+    # Select test frames from depth / normal outputs.
+    depth_pred_all = output["depth"][0].detach().cpu() if "depth" in output else None  # [n_total, 1, H, W]
+    depth_pred     = depth_pred_all[test_frame_inds] if depth_pred_all is not None else None
+    pred_normals_all = output["normal"].detach().cpu() if "normal" in output else None  # [B, n_total, 3, H, W]
+    pred_normals     = pred_normals_all[:, test_frame_inds] if pred_normals_all is not None else None
+
+    if depth_annotation_map and (depth_pred is not None or pred_normals is not None):
         for idx, img_name in enumerate(img_names):
             img_name_str = img_name[0] if isinstance(img_name, list) else img_name
-            print(f"Evaluating normals for {img_name_str}...")
             depth_info = depth_annotation_map.get(img_name_str)
-
             if depth_info is None:
                 continue
+
             depth_path = depth_info["depth_path"]
             orig_h = depth_info["height"]
             orig_w = depth_info["width"]
-            depth = load_16big_png_depth(depth_path).astype(np.float32)
-            depth_aligned = resize_and_crop_depth(depth, args.resolution, args.resolution, orig_h, orig_w)
-            intrinsics = camera_vector_to_intrinsics(cameras_output[0, idx], args.resolution, args.resolution)
-            gt_normals, valid_mask = compute_normals_from_depth(depth_aligned, intrinsics)
-            pred_normal_frame = pred_normals[0, idx]
-            deg = compute_normal_deg_error(pred_normal_frame, gt_normals, valid_mask)
-            if not math.isnan(deg):
-                normals_deg.append(deg)
-        results["deg"] = float(np.nanmean(normals_deg)) if normals_deg else float("nan")
-    else:
-        results["deg"] = float("nan")
+            depth_gt = load_16big_png_depth(depth_path).astype(np.float32)
+            depth_gt_aligned = resize_and_crop_depth(depth_gt, args.resolution, args.resolution, orig_h, orig_w)
+
+            # Intrinsics needed for both depth conversion and normal estimation.
+            intrinsics = camera_vector_to_intrinsics(cameras_test[0, idx], args.resolution, args.resolution)
+
+            # --- Depth RMSE (metres, valid pixels only) ---
+            # GT depth is euclidean (ray) depth (.geometric.png convention in Dynamic Replica).
+            # Renderer output is z-depth (along camera axis).  Convert z -> euclidean so both
+            # are in the same space before computing RMSE.
+            if depth_pred is not None:
+                depth_pred_frame = depth_pred[idx, 0].numpy()  # [H, W]  z-depth
+                depth_pred_frame = _z_to_euclidean(depth_pred_frame, intrinsics)
+                valid = depth_gt_aligned > 0
+                if valid.sum() > 0:
+                    rmse = float(np.sqrt(np.mean((depth_pred_frame[valid] - depth_gt_aligned[valid]) ** 2)))
+                    if not math.isnan(rmse):
+                        depth_rmses.append(rmse)
+
+            # --- Normal degree error ---
+            # Normals are derived from the (euclidean) GT depth, so use depth_gt_aligned directly.
+            if pred_normals is not None:
+                gt_normals, valid_mask = compute_normals_from_depth(depth_gt_aligned, intrinsics)
+                pred_normal_frame = pred_normals[0, idx]
+                deg = compute_normal_deg_error(pred_normal_frame, gt_normals, valid_mask)
+                if not math.isnan(deg):
+                    normals_deg.append(deg)
+
+    results["rmse"] = float(np.nanmean(depth_rmses)) if depth_rmses else float("nan")
+    results["deg"] = float(np.nanmean(normals_deg)) if normals_deg else float("nan")
 
     return results
 
 
 def format_results(results: Dict[str, list], args: argparse.Namespace) -> str:
     """Format evaluation results for display."""
+    stride = getattr(args, "novel_time_stride", 2)
+    n_total = args.subsequence_length
+    n_input = len(range(0, n_total, stride))
+    n_test = n_total - n_input
+
     lines = ["Evaluation results:"]
-    lines.append(f"  subsequence length: {args.subsequence_length}")
-    lines.append(f"  input frames: {args.input_frames}")
+    lines.append(f"  subsequence length: {n_total}")
+    lines.append(f"  novel_time_stride:  {stride}  ({n_input} input / {n_test} test frames)")
     lines.append(f"  evaluation resolution: {args.resolution}x{args.resolution}")
     lines.append(f"  evaluated subsequences: {len(results['psnr'])}")
+    fmt = {"psnr": ".3f", "rmse": ".4f", "lpips": ".4f", "deg": ".3f",
+           "time_s": ".3f", "time_per_frame_s": ".3f"}
     for metric in ["psnr", "rmse", "lpips", "deg", "time_s", "time_per_frame_s"]:
         values = [v for v in results[metric] if not math.isnan(v)]
         if not values:
             lines.append(f"  {metric}: N/A")
             continue
-        lines.append(f"  {metric}: avg={np.mean(values):.4f} min={np.min(values):.4f} max={np.max(values):.4f}")
+        f = fmt.get(metric, ".4f")
+        lines.append(f"  {metric}: avg={np.mean(values):{f}} std={np.std(values):{f}} "
+                     f"min={np.min(values):{f}} max={np.max(values):{f}}")
     return "\n".join(lines)
