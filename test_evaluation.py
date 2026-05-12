@@ -42,12 +42,17 @@ def dummy_results(n=3):
 
 def test_index_sets():
     n_total = 128
+    local_split = 4  # model constraint
     expected = {
         2:  (64,  64),
-        5:  (26, 102),
-        10: (13, 115),
-        20: (7,  121),
+        4:  (32,  96),
+        8:  (16, 112),
+        16: (8,  120),
     }
+    # All valid strides must satisfy n_input % local_split == 0
+    for stride, (exp_in, _) in expected.items():
+        assert exp_in % local_split == 0, \
+            f"stride={stride}: n_input={exp_in} not divisible by local_split={local_split}"
     for stride, (exp_in, exp_test) in expected.items():
         input_inds = set(range(0, n_total, stride))
         test_inds  = [i for i in range(n_total) if i not in input_inds]
@@ -70,7 +75,7 @@ def test_index_sets():
 
 def test_format_results():
     from evaluate_core import format_results
-    for stride in [2, 5, 10, 20]:
+    for stride in [2, 4, 8, 16]:
         args = make_args(stride=stride)
         res  = dummy_results(n=4)
         out  = format_results(res, args)
@@ -120,7 +125,7 @@ def test_cli_rejects_invalid_stride():
 
 def test_cli_accepts_valid_strides():
     """Check that all valid stride values pass argparse (exits on missing data, not on arg parsing)."""
-    for stride in [2, 5, 10, 20]:
+    for stride in [2, 4, 8, 16]:
         result = subprocess.run(
             [sys.executable, "evaluate_dynamic_replica.py",
              "--data-root", "/fake", "--checkpoint", "/fake.pth",

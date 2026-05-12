@@ -9,9 +9,13 @@ using 128-frame subsequences with a configurable input stride.  The stride
 controls how many frames are given as input vs. held out for testing:
 
   stride=2  →  64 input / 64 test  (paper protocol)
-  stride=5  →  26 input / 102 test
-  stride=10 →  13 input / 115 test
-  stride=20 →   7 input / 121 test
+  stride=4  →  32 input / 96 test
+  stride=8  →  16 input / 112 test
+  stride=16 →   8 input / 120 test
+
+Note: the model encoder requires n_input % 4 == 0 (local_split=4 constraint),
+so strides must yield a multiple-of-4 input frame count.  The above four values
+are the natural powers-of-2 that satisfy this for 128-frame windows.
 
 Images are resized to 504x504 by default for controlled comparison.
 
@@ -56,10 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Compute device")
     parser.add_argument("--resolution", type=int, default=504, help="Target image height and width for evaluation")
     parser.add_argument("--subsequence-length", type=int, default=128, help="Frame subsequence length")
-    parser.add_argument("--novel-time-stride", type=int, default=2, choices=[2, 5, 10, 20],
+    parser.add_argument("--novel-time-stride", type=int, default=2, choices=[2, 4, 8, 16],
                         help="Stride for input frame sampling within each window. "
-                             "2 = every other frame as input (64 input / 64 test, paper protocol). "
-                             "5 → 26 input / 102 test.  10 → 13 input / 115 test.  20 → 7 input / 121 test.")
+                             "Must yield n_input divisible by 4 (model local_split constraint). "
+                             "2 = 64 input / 64 test (paper protocol). "
+                             "4 = 32 input / 96 test.  8 = 16 input / 112 test.  16 = 8 input / 120 test.")
     parser.add_argument("--sample-interval", type=int, default=128, help="Window stride for non-overlapping subsequences")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers")
     parser.add_argument("--max-subsequences", type=int, default=None, help="Maximum number of subsequences to evaluate")
@@ -143,6 +148,14 @@ def main() -> None:
     args = parse_args()
     if args.novel_time_stride < 1:
         raise ValueError("novel_time_stride must be >= 1")
+    n_input = len(range(0, args.subsequence_length, args.novel_time_stride))
+    local_split = 4  # model encoder constraint (local_split in tlod-l3.py)
+    if n_input % local_split != 0:
+        raise ValueError(
+            f"novel_time_stride={args.novel_time_stride} gives {n_input} input frames, "
+            f"which is not divisible by the model's local_split={local_split}. "
+            f"Use a stride from {{2, 4, 8, 16}} for 128-frame windows."
+        )
 
     device = args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
     torch.set_grad_enabled(False)
