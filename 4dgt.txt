@@ -1,0 +1,65 @@
+Evaluation results:
+  subsequence length: 128
+  novel_time_stride:  2  (64 input / 64 test frames)
+  evaluation resolution: 504x504
+  evaluated subsequences: 140
+  psnr: avg=24.515 std=1.023 min=21.432 max=27.112
+  rmse: avg=4.4357 std=2.1831 min=0.4958 max=12.1283
+  lpips: avg=0.2898 std=0.0235 min=0.2175 max=0.3363
+  deg: avg=30.689 std=5.579 min=21.081 max=51.003
+  time_s: avg=247.218 std=32.635 min=190.271 max=318.068
+  time_per_frame_s: avg=3.863 std=0.510 min=2.973 max=4.970
+Total evaluation wall time: 38109.981s
+
+Evaluation results:
+  subsequence length: 128
+  novel_time_stride:  4  (32 input / 96 test frames)
+  evaluation resolution: 504x504
+  evaluated subsequences: 140
+  psnr: avg=22.357 std=1.926 min=18.557 max=25.996
+  rmse: avg=4.5407 std=2.1103 min=0.5972 max=11.8904
+  lpips: avg=0.2916 std=0.0256 min=0.2275 max=0.3471
+  deg: avg=30.802 std=5.620 min=21.358 max=51.092
+  time_s: avg=93.183 std=24.891 min=66.614 max=307.281
+  time_per_frame_s: avg=0.971 std=0.259 min=0.694 max=3.201
+Total evaluation wall time: 16994.581s
+
+Evaluation results:
+  subsequence length: 128
+  novel_time_stride:  8  (16 input / 112 test frames)
+  evaluation resolution: 504x504
+  evaluated subsequences: 140
+  psnr: avg=15.931 std=2.114 min=11.400 max=21.567
+  rmse: avg=4.3034 std=2.0094 min=0.3418 max=11.2409
+  lpips: avg=0.3567 std=0.0276 min=0.2832 max=0.4130
+  deg: avg=30.734 std=5.554 min=20.982 max=50.976
+  time_s: avg=10.144 std=0.431 min=9.650 max=14.065
+  time_per_frame_s: avg=0.091 std=0.004 min=0.086 max=0.126
+Total evaluation wall time: 5534.802s
+
+Evaluation results:
+  subsequence length: 128
+  novel_time_stride:  16  (8 input / 120 test frames)
+  evaluation resolution: 504x504
+  evaluated subsequences: 140
+  psnr: avg=11.538 std=2.032 min=7.631 max=16.493
+  rmse: avg=4.8875 std=2.1294 min=0.4053 max=11.9434
+  lpips: avg=0.4342 std=0.0325 min=0.3319 max=0.4898
+  deg: avg=31.262 std=5.705 min=21.046 max=51.820
+  time_s: avg=6.844 std=0.559 min=6.324 max=12.543
+  time_per_frame_s: avg=0.057 std=0.005 min=0.053 max=0.105
+Total evaluation wall time: 5183.714s
+
+Evaluation results:
+  subsequence length: 128
+  novel_time_stride:  32  (4 input / 124 test frames)
+  evaluation resolution: 504x504
+  evaluated subsequences: 140
+  psnr: avg=8.278 std=2.120 min=4.656 max=13.036
+  rmse: avg=5.4960 std=1.8213 min=2.3854 max=11.6081
+  lpips: avg=0.5325 std=0.0393 min=0.4344 max=0.6057
+  deg: avg=37.604 std=7.118 min=24.567 max=61.244
+  time_s: avg=7.561 std=1.212 min=6.377 max=12.754
+  time_per_frame_s: avg=0.061 std=0.010 min=0.051 max=0.103
+Total evaluation wall time: 7359.324s
+

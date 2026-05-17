@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Compute device")
     parser.add_argument("--resolution", type=int, default=504, help="Target image height and width for evaluation")
     parser.add_argument("--subsequence-length", type=int, default=128, help="Frame subsequence length")
-    parser.add_argument("--novel-time-stride", type=int, default=2, choices=[2, 4, 8, 16],
+    parser.add_argument("--novel-time-stride", type=int, default=2, choices=[2, 4, 8, 16, 32],
                         help="Stride for input frame sampling within each window. "
                              "Must yield n_input divisible by 4 (model local_split constraint). "
                              "2 = 64 input / 64 test (paper protocol). "
@@ -227,8 +227,8 @@ def main() -> None:
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
         report_path = os.path.join(args.save_dir, "evaluation_report_dynamic_replica.txt")
-        with open(report_path, "w", encoding="utf8") as f:
-            f.write(summary + f"\nTotal wall time: {total_eval_time:.3f}s\n")
+        with open(report_path, "a", encoding="utf8") as f:
+            f.write(summary + f"\nTotal wall time: {total_eval_time:.3f}s\n\n")
         print(f"Saved evaluation report to {report_path}")
 
 
