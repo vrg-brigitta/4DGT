@@ -541,3 +541,52 @@ def compute_rays(fov, matrix, res):
     rays_d = rays_d_un / np.linalg.norm(rays_d_un, axis=-1)[:, :, None]
 
     return rays_o, rays_d, rays_d_un
+
+def readPFM(file):
+    file = open(file, "rb")
+
+    color = None
+    width = None
+    height = None
+    scale = None
+    endian = None
+
+    header = file.readline().rstrip()
+    if header == b"PF":
+        color = True
+    elif header == b"Pf":
+        color = False
+    else:
+        raise Exception("Not a PFM file.")
+
+    dim_match = re.match(rb"^(\d+)\s(\d+)\s$", file.readline())
+    if dim_match:
+        width, height = map(int, dim_match.groups())
+    else:
+        raise Exception("Malformed PFM header.")
+
+    scale = float(file.readline().rstrip())
+    if scale < 0:  # little-endian
+        endian = "<"
+        scale = -scale
+    else:
+        endian = ">"  # big-endian
+
+    data = np.fromfile(file, endian + "f")
+    shape = (height, width, 3) if color else (height, width)
+
+    data = np.reshape(data, shape)
+    data = np.flipud(data)
+    return data
+
+def load_16big_png_depth(depth_png):
+    from PIL import Image
+    with Image.open(depth_png) as depth_pil:
+        # the image is stored with 16-bit depth but PIL reads it as I (32 bit).
+        # we cast it to uint16, then reinterpret as float16, then cast to float32
+        depth = (
+            np.frombuffer(np.array(depth_pil, dtype=np.uint16), dtype=np.float16)
+            .astype(np.float32)
+            .reshape((depth_pil.size[1], depth_pil.size[0]))
+        )
+    return depth
