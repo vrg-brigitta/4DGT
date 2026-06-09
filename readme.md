@@ -1,46 +1,6 @@
-<div align="center">
+# A fork of 4DGT to test on Dynamic Replica and do further evaluation
 
-<h3> 4DGT: Learning a 4D Gaussian Transformer Using Real-World Monocular Videos </h3>
-<h4>NeurIPS 2025 (Spotlight)</h4>
-
-<a href="https://arxiv.org/abs/2506.08015">
-  <img src="https://img.shields.io/badge/2506.08015-arXiv-red" alt="arXiv">
-</a>
-<a href="https://4dgt.github.io/">
-  <img src="https://img.shields.io/badge/4DGT-project_page-blue" alt="Project Page">
-</a>
-
-<br/>
-
-<a href="https://zhenx.me" target="_blank">Zhen Xu<sup>1,2,*</sup></a>
-<a href="https://sites.google.com/view/zhengqinli" target="_blank">Zhengqin Li<sup>1</sup></a>
-<a href="https://flycooler.com/" target="_blank">Zhao Dong<sup>1</sup></a>
-<a href="https://xzhou.me" target="_blank">Xiaowei Zhou<sup>2</sup></a>
-<a href="https://rapiderobot.bitbucket.io/" target="_blank">Richard Newcombe<sup>1</sup></a>
-<a href="https://lvzhaoyang.github.io/" target="_blank">Zhaoyang Lv<sup>1</sup></a>
-</a>
-<p>
-    <sup>1</sup>Reality Labs Research, Meta&nbsp;&nbsp;&nbsp;&nbsp;<sup>2</sup>Zhejiang University
-    <br />
-    <span style="color: #5a6268; font-size: 0.9em">
-        <sup>*</sup>Work done during internship at Meta.&nbsp;&nbsp;&nbsp;&nbsp;
-    </span>
-</p>
-
-[![4DGT](assets/vid/teaser.gif)](https://4dgt.github.io/)
-
-</div>
-
-Please cite this paper if you find this repository useful.
-
-``` bash
-@inproceedings{xu20254dgt,
-    title     = {4DGT: Learning a 4D Gaussian Transformer Using Real-World Monocular Videos},
-    author    = {Xu, Zhen and Li, Zhengqin and Dong, Zhao and Zhou, Xiaowei and Newcombe, Richard and Lv, Zhaoyang},
-    journal   = {arXiv preprint arXiv:2506.08015},
-    year      = {2025}
-}
-```
+The original repository can be found at: https://github.com/facebookresearch/4DGT
 
 ## Installation
 
@@ -64,59 +24,6 @@ python -m tlod.download_model
 
 You can also skip this step and it will automatically download it when executing the following commands.
 
-## Aria Datasets
-
-We provide two examples of converting a typical Aria recording in `.vrs` to the format recognized by *4DGT*. For details of the data format being processed, check [docs/data.md](docs/data.md).
-
-
-#### Run on an Aria sequence from Aria Explorer
-
-We use the sequence from [the Aria Explorer](https://explorer.projectaria.com/aea/loc3_script3_seq1_rec1?st=%220%22) from Aria Everyday Activity as an example. This approach applies to any sequence downloaded from Aria Explorer. 
-
-```bash
-mkdir -p data/aea 
-cd data/aea
-
-# Put the download URL JSON file into data/aea folder
-# The download URL file will be different if you choose a different sequence. 
-aria_dataset_downloader -c loc3_script3_seq1_rec1_download_urls.json -o . -l all
-```
-
-Run the following to process the sequence: 
-```bash
-# Process the sequence "loc3_script3_seq1_rec1"
-DATA_INPUT_DIR="data/aea/loc3_script3_seq1_rec1" \
-DATA_PROCESSED_DIR="data/aea/loc3_script3_seq1_rec1" \
-VRS_FILE="recording.vrs" \
-bash tlod/scripts/run_vrs_preprocessing.sh
-```
-
-#### Run on Aria Digital Twin sequence
-
-The Aria Digital Twin uses synthetic rendering as an evaluation mechanism. Follow these steps to download an example sequence:
-
-```bash
-# Create a directory for datasets
-mkdir -p data/adt-raw
-cd data/adt-raw
-
-# Put the download link file "ADT_download_urls.json" in the current directory
-# Get the file from: https://facebookresearch.github.io/projectaria_tools/docs/open_datasets/aria_digital_twin_dataset/dataset_download
-
-# Download the sample data
-aria_dataset_downloader --cdn_file ADT_download_urls.json --output_folder . --data_types 0 1 2 3 4 5 6 7 8 9 --sequence_names Apartment_release_multiuser_cook_seq141_M1292 Apartment_release_multiskeleton_party_seq114_M1292 Apartment_release_meal_skeleton_seq135_M1292 Apartment_release_work_skeleton_seq137_M1292
-```
-
-```bash
-# Process the synthetic sequence "Apartment_release_multiuser_cook_seq141_M1292"
-DATA_INPUT_DIR="data/adt-raw/Apartment_release_multiuser_cook_seq141_M1292" \
-DATA_PROCESSED_DIR="data/adt/Apartment_release_multiuser_cook_seq141_M1292" \
-VRS_FILE="synthetic_video.vrs" \
-bash tlod/scripts/run_vrs_preprocessing.sh
-```
-
-After this, you should have a `data/adt/Apartment_release_multiuser_cook_seq141_M1292/synthetic_video/camera-rgb-rectified-600-h1000` folder corresponding to the format discussed above.
-
 ## Dynamic Replica dataset
 
 Download following the instructions in the [DynamicReplica](https://dynamic-stereo.github.io) dataset's own repository.
@@ -126,47 +33,56 @@ Then the data loader can be tested using the following command and the correct d
 python -m tlod.data_loader.test_datasets --data-root 'data/dynamic_replica'
 ```
 
-## Inference
+#### Run
 
-We provide a simplified Python interface with cleaner configuration. During execution, each batch waits for the previous one to complete: the model encoder generates Gaussians, the renderer processes them, then saves to disk—all in sequence. Rendering all 128 frames will take some time to complete.
+4DGT inference on Dynamic Replica (mono / left camera) with full-sequence
+stitching and ground-truth side-by-side comparison.
+
+Run from the 4DGT repo root, with your conda env activated:
 
 ```bash
-# Run inference on the above AEA sequence 
-# It will produce the novel view spiral rendering on the chosen timestamps among all the frames.
-python -m tlod.run \
-    data_path=data/aea \
-    seq_list=loc3_script3_seq1_rec1 \
-    seq_data_root=recording/camera-rgb-rectified-600-h1000 \
-    novel_view_timestamps="[1.42222, 2.84444]" 
-
-python -m tlod.run data_path=data/aea seq_list=loc3_script3_seq1_rec1 seq_data_root=recording/camera-rgb-rectified-600-h1000 novel_view_timestamps="[1.42222, 2.84444]" image_num_per_batch=64 num_workers=0 persistent_workers=false
-
-python -m tlod.run data_path=C:\\Development\\AI\\CV2\\dynamic_stereo\\dynamic_replica_data\\test dataset_type=dynamic_replica image_num_per_batch=64 num_workers=0 persistent_workers=false
-
-# Run inference on the above ADT sequence 
-# Frame sample indicates running only on the last 128 frames.
-python -m tlod.run \
-    data_path=data/adt \
-    seq_list=Apartment_release_multiuser_cook_seq141_M1292 \
-    seq_data_root=synthetic_video/camera-rgb-rectified-600-h1000 \
-    frame_sample="[-128, null, 1]" \
-    novel_view_timestamps="[1.42222, 2.84444]"
+    python run_dynamic_replica.py \
+        --data_root <data-root-location> \
+        --checkpoint checkpoints/4dgt_full.pth \
+        --output_dir outputs/dynamic_replica \
+        --num_frames 32 --image_res 504 --full_sequence
 ```
 
-To run the inference, make sure the GPU has at least 16GB of available VRAM.
+What it does:
+  1. Builds DynamicReplicaDataset.
+     with the '--full_sequence' parameter, it covers all N frames of the chosen sequence with non-overlapping windows of 32 (or the value given in the '--num_frames' parameter), then concatenates the per-batch outputs into ONE long video.
+     If novel_time_sampling=True, the input is a subset of frames, the model has to interpolate the rest.
+  2. Loads 4DGT (level-of-detail model used in run.py).
+  3. Encodes each window into 4D Gaussians, renders all output timestamps,
+     saves per-batch videos AND stitches them into:
+         <output_dir>/full_pred.mp4                  (predictions only)
+         <output_dir>/full_gt.mp4                    (GT, same crop/res)
+         <output_dir>/full_side_by_side.mp4          (GT | pred + labels)
 
-The full evaluation and inference on other datasets is still a work in progress. We will release them in the near future. 
 
-We also provide the first stage model, which is trained only using EgoExo4D data following the description in our paper. It does not use level-of-detail design and will predict much denser Gaussians as output. You can use it as a reference using the following command: 
+#### Run NVS
+
+Novel-View Synthesis (NVS) on Dynamic Replica with 4DGT.
+
+Difference vs run_dynamic_replica.py:
+  - Inputs: ALL frames at their original poses + timestamps (model gets full appearance + geometry context).
+  - Outputs: same timestamps as inputs, but at MODIFIED camera poses (orbit / dolly / pan / spiral around the original trajectory).
+
+The script writes:
+    <output_dir>/nvs_pred.mp4               -- predictions at novel viewpoints
+    <output_dir>/nvs_gt.mp4                 -- original input video (GT)
+    <output_dir>/nvs_side_by_side.mp4       -- [GT @ original view | Pred @ novel view]
+
+Run from the 4DGT repo root:
+
 ```bash
-python -m tlod.run \
-    checkpoint=checkpoints/4dgt_1st_stage.pth \
-    exp_name=exp_4dgt_1st_stage \
-    config=configs/models/tlod.py \
-    data_path=data/aea \
-    seq_list=loc3_script3_seq1_rec1 \
-    seq_data_root=recording/camera-rgb-rectified-600-h1000 \
-    novel_view_timestamps="[1.42222, 2.84444]"
+    python run_dynamic_replica_nvs.py \
+        --data_root <data-root-location> \
+        --checkpoint checkpoints/4dgt_full.pth \
+        --output_dir outputs/dynamic_replica_nvs \
+        --num_frames 32 --image_res 504 \
+        --camera_path orbit --orbit_radius 0.3 --orbit_revolutions 1.0 \
+        --full_sequence
 ```
 
 ## Evaluation
@@ -175,7 +91,6 @@ PSNR, LPIPS, RMSE, and normal angle error (deg)
 ```bash
 python .\evaluate_dynamic_replica.py --data-root .\data\dynamicreplica\ --mode test --checkpoint checkpoints/4dgt_full.pth --config configs/models/tlod.py
 ```
-
 
 ## GUI & Interactive Viewer
 
@@ -189,13 +104,3 @@ python -m tlod.run_viewer \
 ```
 
 It has a slider to allow you to control the space (frame) and time. Currently, the asynchronous model prediction process may slow down the interactive rendering depending on which GPU you use. We may enhance this in our future plans. 
-
-## LICENSE 
-
-This implementation is Creative Commons licensed, as found in the LICENSE file.
-
-The work built in this repository benefits from the great work in the following open-source projects:
-* [Project Aria tool](https://github.com/facebookresearch/projectaria_tools): Apache 2.0
-* [Egocentric Splats](https://github.com/facebookresearch/egocentric_splats): CC-NC, Meta. 
-* [EasyVolcap](https://github.com/zju3dv/EasyVolcap): MIT
-* [Nerfview](https://github.com/nerfstudio-project/nerfview): Apache 2.0
